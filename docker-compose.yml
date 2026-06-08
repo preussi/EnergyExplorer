@@ -1,0 +1,31 @@
+services:
+  backend:
+    build: ./backend
+    volumes:
+      - ./data:/data:ro
+      - ./backend/cache:/app/cache
+    environment:
+      DATA_DIR: /data
+      CACHE_DIR: /app/cache
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  # db:                       # phase 3 — uncomment when persistence is needed
+  #   image: postgres:16
+  #   environment:
+  #     POSTGRES_PASSWORD: dev
+  #     POSTGRES_DB: energy
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+
+# volumes:
+#   pgdata:

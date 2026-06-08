@@ -1,0 +1,5 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+numpy>=2.0
+scikit-learn>=1.5
+umap-learn>=0.5   # uncomment to enable UMAP in the cache builder
