@@ -7,7 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .data import SAMPLERS, SPACES, get_dataset
+from .generate import extremes as run_extremes
+from .generate import flexibility as run_flexibility
 from .generate import generate as run_generate
+from .generate import shadow as run_shadow
+from .generate import shadow_pairs as run_shadow_pairs
 from .projections import METHODS, project
 
 app = FastAPI(title="Energy Explorer API", version="0.1.0")
@@ -17,7 +21,7 @@ app = FastAPI(title="Energy Explorer API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -41,6 +45,7 @@ def meta():
             "u_star": ds.u_star.tolist(),
             "c_star": ds.c_star,
             "epsilon": ds.epsilon,
+            "norm": ds.optimum_norm.tolist(),
         },
         "diagnostics": ds.diagnostics,
     }
@@ -143,6 +148,16 @@ def samples(
     }
 
 
+@app.get("/api/extremes")
+def extremes(sampler: str = Query("chrrt")):
+    """MGA extreme designs: per technology, its min and max over the polytope
+    (LP vertices), as physical values + base-PCA coordinates."""
+    ds = get_dataset()
+    if sampler not in SAMPLERS:
+        raise HTTPException(status_code=400, detail=f"unknown sampler {sampler!r}")
+    return {"sampler": sampler, "extremes": run_extremes(ds, sampler)}
+
+
 class Constraint(BaseModel):
     axis: str
     min: float | None = None
@@ -154,6 +169,39 @@ class GenerateRequest(BaseModel):
     n: int = 2000
     seed: int = 42
     constraints: list[Constraint] = []
+
+
+class ShadowRequest(BaseModel):
+    x: str
+    y: str
+    constraints: list[Constraint] = []
+
+
+class FlexibilityRequest(BaseModel):
+    constraints: list[Constraint] = []
+
+
+@app.get("/api/shadow_pairs")
+def shadow_pairs():
+    """All axis pairs ranked by shadow interestingness (ascending boxiness)."""
+    return {"pairs": run_shadow_pairs(get_dataset())}
+
+
+@app.post("/api/shadow")
+def shadow(req: ShadowRequest):
+    """Exact 2-D shadow polygon of the (optionally constrained) polytope."""
+    ds = get_dataset()
+    try:
+        return run_shadow(ds, req.x, req.y, [c.model_dump() for c in req.constraints])
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/flexibility")
+def flexibility(req: FlexibilityRequest):
+    """Exact remaining [min, max] per axis under the given constraints."""
+    ds = get_dataset()
+    return run_flexibility(ds, [c.model_dump() for c in req.constraints])
 
 
 @app.post("/api/generate")

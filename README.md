@@ -1,7 +1,9 @@
 # Energy Explorer
 
 Interactive exploration of **near-optimal energy-system designs** (MGA space).
-See [DESIGN.md](DESIGN.md) for the architecture sketch and roadmap.
+See [DESIGN.md](DESIGN.md) for the architecture sketch and roadmap, and
+[PROCESSES.md](PROCESSES.md) for how every process works (data provenance,
+sampling math, projections, generation, and the visual-analytics overlays).
 
 Phase 0 scaffold: a FastAPI backend that loads the polytope/sample data and
 serves projections, plus a Svelte + regl frontend that renders the 2D PCA

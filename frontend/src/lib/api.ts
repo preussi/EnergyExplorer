@@ -7,7 +7,7 @@ export interface Meta {
   spaces: string[];
   n_samples: number;
   cost_axis: string;
-  optimum: { u_star: number[]; c_star: number; epsilon: number };
+  optimum: { u_star: number[]; c_star: number; epsilon: number; norm: number[] };
   diagnostics: Record<string, { rhat: number[]; ess: number[] }>;
 }
 
@@ -114,10 +114,64 @@ export function getClusters(
   return getJSON<ClustersData>(`/api/clusters?${p}`);
 }
 
+export interface ExtremeDesign {
+  axis: string;
+  kind: "min" | "max";
+  values: number[]; // physical, all 10 axes
+  point: number[]; // base-PCA coordinates
+  cost: number;
+}
+
+export function getExtremes(sampler: string): Promise<{ sampler: string; extremes: ExtremeDesign[] }> {
+  return getJSON(`/api/extremes?${new URLSearchParams({ sampler })}`);
+}
+
 export interface ConstraintInput {
   axis: string;
   min?: number | null;
   max?: number | null;
+}
+
+export interface ShadowPair {
+  x: string;
+  y: string;
+  boxiness: number;
+}
+
+export interface Shadow {
+  x: string;
+  y: string;
+  feasible: boolean;
+  polygon: number[][]; // physical units, hull-ordered
+  boxiness: number | null;
+  optimum: [number, number];
+}
+
+export interface FlexRange {
+  axis: string;
+  min: number | null;
+  max: number | null;
+}
+
+export interface Flexibility {
+  feasible: boolean;
+  ranges: FlexRange[];
+}
+
+export function getShadowPairs(): Promise<{ pairs: ShadowPair[] }> {
+  return getJSON("/api/shadow_pairs");
+}
+
+export function getShadow(
+  x: string,
+  y: string,
+  constraints: ConstraintInput[] = [],
+): Promise<Shadow> {
+  return postJSON<Shadow>("/api/shadow", { x, y, constraints });
+}
+
+export function getFlexibility(constraints: ConstraintInput[] = []): Promise<Flexibility> {
+  return postJSON<Flexibility>("/api/flexibility", { constraints });
 }
 
 export interface GenerateResult {

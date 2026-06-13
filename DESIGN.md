@@ -318,8 +318,20 @@ services:
 - [x] **3b** Manual constraint controls (axis + min/max), constraint chips (incl.
       live brush constraints), designs-count, graceful infeasibility message.
 - [ ] **3c** Add Postgres (container 3): save sessions, bookmark designs, feedback.
-- [ ] **3d** Compare steered candidates vs. full space; objective-directed (MGA)
-      generation; iterative co-adaptive loop; hopsy for rigorous sampling.
+- [x] **3d (part) — visual-analytics suite** (see PROCESSES.md §10): A→B design
+      paths with feasible morphing (convexity), LP extreme-design spokes
+      (`/api/extremes`), PCA tech compass (biplot), option-topography density
+      contours, MCMC sampler-walk animation, pinned-design compare tray with
+      radar glyphs + Δcost, kNN find-similar.
+- [x] **3e — polytope-native exploration** (PROCESSES.md §10.8–10.10): Facets
+      tab with exact LP shadow polygons per axis pair (ranked by boxiness, live
+      constrained overlay); remaining-flexibility LP bars; star-coordinates
+      steered projection with grand tour. "Clusters" renamed to "regions"
+      (uniform data has none).
+- [ ] **3d (rest)** Objective-directed (MGA) generation; hopsy for rigorous
+      sampling; side-by-side candidate-vs-full-space comparison stats.
+      Considered & deferred: archetypal analysis + simplex plot; cost-aligned
+      supervised projection.
 
 ---
 

@@ -11,6 +11,8 @@
     colorCategorical = false,
     colorMin = 0,
     colorMax = 1,
+    overlay = null,
+    overlayColor = "#ffffff",
     onbrush,
   }: {
     fields: string[];
@@ -20,6 +22,8 @@
     colorCategorical?: boolean;
     colorMin?: number;
     colorMax?: number;
+    overlay?: number[] | null; // one design's values (all fields) drawn as a bright line
+    overlayColor?: string;
     onbrush?: (
       rows: number[] | null,
       constraints: { axis: string; min: number; max: number }[],
@@ -215,9 +219,12 @@
 
   // Highlight layer, colored by the current field. When a selection is active we
   // color just the selection (over the faint base); otherwise we color all rows
-  // as a vivid overview. Reads scales/xPos/selected/rowColor; writes nothing.
+  // as a vivid overview. An optional `overlay` design (e.g. the A→B morph or a
+  // hovered pin) is drawn on top as a single bright glowing line.
+  // Reads scales/xPos/selected/rowColor/overlay; writes nothing.
   $effect(() => {
     const sel = selected, w = W, h = H, sc = scales, xp = xPos, rc = rowColor;
+    const ov = overlay, oc = overlayColor;
     if (!hl || !w || !h || !sc.length) return;
     const ctx = setupCanvas(hl, w, h);
     ctx.clearRect(0, 0, w, h);
@@ -225,6 +232,23 @@
     const rows: Iterable<number> = hasSel ? sel! : values.keys();
     ctx.lineWidth = hasSel ? 0.9 : 0.5;
     strokeColored(ctx, rows, hasSel ? 0.5 : 0.22, sc, xp, rc);
+
+    if (ov && ov.length === fields.length) {
+      ctx.lineWidth = 2.4;
+      ctx.strokeStyle = oc;
+      ctx.shadowColor = oc;
+      ctx.shadowBlur = 7;
+      ctx.globalAlpha = 0.95;
+      ctx.beginPath();
+      for (let a = 0; a < xp.length; a++) {
+        const x = xp[a], y = sc[a](ov[a]);
+        if (a === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+    }
   });
 </script>
 
