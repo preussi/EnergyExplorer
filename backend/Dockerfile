@@ -7,7 +7,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-ENV DATA_DIR=/data \
+# Bake the read-only sample data into the image so the container is
+# self-contained on Kubernetes (no data volume to provision).
+COPY data ./data
+
+ENV DATA_DIR=/app/data \
     CACHE_DIR=/app/cache
 EXPOSE 8000
 

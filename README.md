@@ -10,8 +10,8 @@ serves projections, plus a Svelte + regl frontend that renders the 2D PCA
 scatter of 20,000 designs (colored by total cost).
 
 ```
-data/        the two .npz files (mounted read-only)
-backend/     FastAPI + numpy + scikit-learn
+backend/     FastAPI + numpy + scikit-learn (data/ holds the two .npz files,
+             baked into the image)
 frontend/    Svelte + Vite + regl (WebGL scatter)
 docker-compose.yml
 ```
@@ -34,7 +34,7 @@ Backend:
 ```bash
 cd backend
 pip install -r requirements.txt
-DATA_DIR=../data uvicorn app.main:app --reload --port 8000
+DATA_DIR=./data uvicorn app.main:app --reload --port 8000
 ```
 
 Frontend (proxies /api to localhost:8000 via Vite):
@@ -69,7 +69,7 @@ lists what was written. UMAP needs `umap-learn` (already enabled in
 To build locally without Docker instead:
 ```bash
 cd backend
-DATA_DIR=../data CACHE_DIR=./cache python -m app.projections
+DATA_DIR=./data CACHE_DIR=./cache python -m app.projections
 ```
 
 ## API

@@ -1,0 +1,295 @@
+###################################################
+# EnergyExplorer deployment pipeline.             #
+# Based on the IVIA generic-helm-chart example,   #
+# configured for this project:                    #
+#   - backend:  FastAPI (uvicorn) on :8000        #
+#   - frontend: Svelte build served by nginx :80, #
+#               proxying /api to the backend Svc   #
+#   - no Postgres (not used yet; re-add a          #
+#     deploy:db stage when phase 3c lands)         #
+###################################################
+
+
+###########################################
+# INCLUDE EXTERNAL TEMPLATES
+###########################################
+include:
+  - project: 'ou-ivia/generic-helm-chart'
+    ref: main
+    file:
+      - 'gitlab-ci-templates/setup-env-variables.yml'
+      - 'gitlab-ci-templates/define-trigger-rules.yml'
+      - 'gitlab-ci-templates/cleanup-defs.yml'
+
+
+###########################################
+# CONFIGURATION
+###########################################
+stages:
+  - prepare
+  - build
+  - build:image
+  - deploy:backend
+  - deploy:frontend
+  - verify
+  - cleanup
+
+variables:
+  # The suffix of the url (suffix.tld):
+  # feature branches: branch-name.suffix.tld
+  # production:       suffix.tld
+  URL_SUFFIX: energyexplorer.ivia.ch
+  #
+  # Length of any pre-/suffix added to the release name or URL. Our longest
+  # release suffix is "-frontend" => 9 characters.
+  RELEASE_NAME_EXTRA_CHARS: 9
+  #
+  # Helm chart name
+  HELM_CHART: oci://${CI_REGISTRY}/ivia-generic-helm-chart/ivia-generic-helm-chart
+  #
+  # Helm chart version
+  HELM_CHART_VERSION: 3.9.0
+  #
+  # Location of Helm's values.yaml
+  HELM_VALUES_LOCATION: ./helm
+  #
+  # Dockerfile location (relative to each layer's build context)
+  DOCKERFILE_LOC: ./Dockerfile
+  #
+  # Docker context (default root; each APP_LAYER is built from ./<layer>)
+  DOCKER_CONTEXT: ./
+  #
+  # Helm Timeout. Helm waits until all deployed resources show ready state.
+  HELM_TIMEOUT: 10m0s
+  #
+  REPLICA_COUNT_PRODUCTION: 1
+  #
+  REPLICA_COUNT_FB: 1
+  #
+  # The patterns that feature branch names are scanned for to determine if they should be deployed
+  BRANCH_DEPLOYMENT_PATTERN: '/\-(ci|deploy|exec)$/'
+  #
+  # The patterns that commit messages are scanned for to determine if a commit on a feature branch should be deployed
+  COMMIT_DEPLOYMENT_PATTERN: '/\[(ci|deploy|exec|CI|DEPLOY|EXEC)\]/'
+  #
+  # The patterns that commit messages are scanned for to determine if a commit on a feature branch that is deployed by default should not be deployed
+  COMMIT_NO_DEPLOYMENT_PATTERN: '/\[!(ci|deploy|exec|CI|DEPLOY|EXEC)\]/'
+  #
+  # The pattern that tags are scanned for to determine if they should be deployed
+  VERSION_TAG_PATTERN: '/^v.*/'
+  #
+  # Set image name. This is only set by default if GitLab's Container Registry is enabled for the project.
+  CI_REGISTRY_IMAGE: $CI_REGISTRY/$CI_REGISTRY_PROJECT/$CI_PROJECT_PATH
+  #
+  # Variables to be configured when manually triggering the pipeline.
+  RUN_ALWAYS:
+    description: "Set this variable to `true` to force deployment."
+    value: "false"
+    options:
+      - "false"
+      - "true"
+  #
+  # In-cluster address of the backend Service, consumed by the frontend's nginx
+  # (${BACKEND_URL}) to proxy /api/*. RELEASE_NAME / K8S_NAMESPACE come from the
+  # included setup-env-variables template.
+  BACKEND_HOST_INTERNAL: "http://${RELEASE_NAME}-backend.${K8S_NAMESPACE}.svc.cluster.local:8000"
+
+
+###########################################
+# BUILD
+###########################################
+
+# place any code-compilation build jobs here (none needed: images build their own assets)
+
+
+###########################################
+# DOCKERIZE
+###########################################
+
+build:image:
+  extends: .deployment-rules-vars
+  stage: build:image
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [ "" ]
+  # Run parallel builds for multi-arch support. See: https://github.com/GoogleContainerTools/kaniko#building-the-separate-container-images
+  parallel:
+    matrix:
+      - APP_LAYER: frontend
+        ARCH:
+          - amd64
+          - arm64
+      - APP_LAYER: backend
+        ARCH:
+          - amd64
+          - arm64
+  tags:
+    - runner-${ARCH}
+  # Sometimes, Azure needs more time to scale the GitLab runner node pool up. Therefore, we set the timeout to 10 minutes.
+  timeout: 10m
+  retry: 2
+  script:
+    # Copy the docker config to the kaniko executor. This config is used to authenticate with the registry.
+    - echo "${DOCKER_REGISTRY_AUTH}" > /kaniko/.docker/config.json
+    - cat /kaniko/.docker/config.json
+    # define the image
+    - IMG="${CI_REGISTRY_IMAGE}:${RELEASE_NAME}-${APP_LAYER}-${ARCH}"
+    # Only build but do not push to registry for feature branches/commits that are not being deployed.
+    - |
+      if [[ "${DEPLOY}" == "true" ]]; then
+        NO_PUSH=""
+      else
+        NO_PUSH="--no-push"
+      fi
+    # build (and push)
+    - >
+      /kaniko/executor
+      --context ${DOCKER_CONTEXT}/${APP_LAYER}
+      --dockerfile $DOCKERFILE_LOC
+      --destination $IMG
+      --no-push-cache
+      $NO_PUSH
+
+# define a job for creating and pushing a merged manifest for multi-arch support. See: https://github.com/GoogleContainerTools/kaniko#merging-the-container-manifests
+build:merge-manifests:
+  variables:
+    GIT_STRATEGY: none # Skip cloning the repository. We don't need it.
+  extends: .deployment-rules-triggers
+  stage: build:image
+  # all containers must be build before merging them
+  # alternatively the job may be configured to run in a later stage
+  needs:
+    - job: build:image
+      artifacts: false
+    - job: export-environment
+      artifacts: true
+  image:
+    name: mplatform/manifest-tool:alpine
+    entrypoint: [ "" ]
+  parallel:
+    matrix:
+      - APP_LAYER: frontend
+      - APP_LAYER: backend
+  script:
+    - echo $DEPLOY
+    - echo $CI_PROJECT_NAME
+    - echo $RELEASE_NAME
+    - >
+      manifest-tool
+      --username="${CI_REGISTRY_USER}"
+      --password="${CI_REGISTRY_PASSWORD}"
+      push from-args
+      --platforms linux/amd64,linux/arm64
+      --template ${CI_REGISTRY_IMAGE}:${RELEASE_NAME}-${APP_LAYER}-ARCH
+      --target ${CI_REGISTRY_IMAGE}:${RELEASE_NAME}-${APP_LAYER}
+  environment:
+    name: $CI_PROJECT_NAME/$CI_COMMIT_REF_SLUG
+    # Delete image after branch is deleted
+    on_stop: remove-images
+
+###########################################
+# DEPLOY
+###########################################
+
+.deploy-template:
+  extends: .deployment-rules-triggers
+  image:
+    name: alpine/helm:3.14.1
+    entrypoint: [ "bash" ]
+  before_script:
+    # Login helm into docker registry
+    - echo ${CI_REGISTRY_PASSWORD} | helm registry login -u ${CI_REGISTRY_USER} --password-stdin ${CI_REGISTRY}
+  environment:
+    url: https://$URL_FULL
+    name: $CI_PROJECT_NAME/$CI_COMMIT_REF_SLUG
+    # Delete deployment after branch is deleted
+    on_stop: remove-deployment
+
+# Backend is deployed first so its Service exists before the frontend's nginx
+# resolves ${BACKEND_URL} at startup.
+deploy-backend:
+  extends: .deploy-template
+  stage: deploy:backend
+  script:
+    - echo "Installing backend from image ${CI_REGISTRY_IMAGE}:${RELEASE_NAME}-backend."
+    - >
+      helm upgrade
+      ${RELEASE_NAME}-backend
+      ${HELM_CHART}
+      --version ${HELM_CHART_VERSION}
+      --namespace $K8S_NAMESPACE
+      --kube-context $K8S_CONTEXT
+      --install
+      --atomic
+      -f "${HELM_VALUES_LOCATION}/backend/values.yaml"
+      --timeout "${HELM_TIMEOUT}"
+      --set app.ingress.url="backend.${URL_FULL}"
+      --set app.replicaCount="${REPLICA_COUNT}"
+      --set app.image.repository="${CI_REGISTRY_IMAGE}"
+      --set app.image.tag="${RELEASE_NAME}-backend"
+      --set image.host="${CI_REGISTRY}"
+
+deploy-frontend:
+  extends: .deploy-template
+  stage: deploy:frontend
+  script:
+    - echo "Installing frontend from image ${CI_REGISTRY_IMAGE}:${RELEASE_NAME}-frontend."
+    - >
+      helm upgrade
+      ${RELEASE_NAME}-frontend
+      ${HELM_CHART}
+      --version ${HELM_CHART_VERSION}
+      --namespace $K8S_NAMESPACE
+      --kube-context $K8S_CONTEXT
+      --install
+      --atomic
+      -f "${HELM_VALUES_LOCATION}/frontend/values.yaml"
+      --timeout "${HELM_TIMEOUT}"
+      --set app.ingress.url="${URL_FULL}"
+      --set app.replicaCount="${REPLICA_COUNT}"
+      --set app.image.repository="${CI_REGISTRY_IMAGE}"
+      --set app.image.tag="${RELEASE_NAME}-frontend"
+      --set image.host="${CI_REGISTRY}"
+      --set app.extraEnv.BACKEND_URL="${BACKEND_HOST_INTERNAL}"
+
+
+###########################################
+# VERIFY & DEBUG
+###########################################
+
+verify:
+  extends: .deployment-rules-triggers
+  stage: verify
+  tags:
+    # This job needs to run outside of ETH as the internal DNS does not resolve internal addresses correctly.
+    - ivialab-aks-cluster
+  image: curlimages/curl:8.6.0
+  before_script:
+    - alias curl='curl -v --fail --connect-timeout 10 --max-time 10 --retry 20 --retry-delay 10 --retry-max-time 120'
+  script:
+    # Verify the apps are reachable.
+    - curl https://$URL_FULL
+    - curl https://backend.$URL_FULL/api/health
+  retry: 2
+
+
+###########################################
+# CLEANUP NEW ENV
+###########################################
+
+remove-deployment:
+  extends: .remove-template
+  image:
+    name: alpine/helm:3.14.1
+    entrypoint: [ "bash" ]
+  before_script:
+    - apk add --no-cache bash curl
+  script:
+    # set default namespace
+    - export HELM_NAMESPACE=${K8S_NAMESPACE}
+    - export HELM_KUBECONTEXT=${K8S_CONTEXT}
+    # DEBUG
+    - echo $RELEASE_NAME
+    # delete deployments
+    - helm status ${RELEASE_NAME}-backend  && helm delete ${RELEASE_NAME}-backend  || true
+    - helm status ${RELEASE_NAME}-frontend && helm delete ${RELEASE_NAME}-frontend || true

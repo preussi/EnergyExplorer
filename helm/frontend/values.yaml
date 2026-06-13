@@ -1,0 +1,69 @@
+# Helm values for the EnergyExplorer frontend (Svelte build served by nginx).
+# Declare variables to be passed into your templates.
+
+app:
+  image:
+    repository: null      # set by CI: --set app.image.repository
+    tag: latest           # set by CI: --set app.image.tag
+    pullPolicy: Always
+
+  # either StatefulSet, Deployment, or Job
+  type: Deployment
+
+  replicaCount: 1
+
+  # nginx listens on 80 (see frontend/Dockerfile).
+  port: 80
+
+  # Health check: nginx serves the SPA at the root.
+  health: "/"
+
+  updateStrategy: Recreate
+
+  # nginx proxies /api to the backend Service; CI sets the in-cluster address.
+  extraEnv:
+    BACKEND_URL: null       # set by CI: --set app.extraEnv.BACKEND_URL
+
+  readinessProbe: |
+    httpGet:
+      path: {{ .Values.app.health }}
+      {{- if eq (typeOf .Values.app.port) "[]interface {}" }}
+      port: {{ first .Values.app.port }}
+      {{- else }}
+      port: {{ .Values.app.port }}
+      {{- end }}
+    initialDelaySeconds: 3
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+
+  livenessProbe: |
+    httpGet:
+      path: {{ .Values.app.health }}
+      {{- if eq (typeOf .Values.app.port) "[]interface {}" }}
+      port: {{ first .Values.app.port }}
+      {{- else }}
+      port: {{ .Values.app.port }}
+      {{- end }}
+    initialDelaySeconds: 6
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 4
+    successThreshold: 1
+
+  startupProbe: null
+
+  requests:
+    cpu: null
+    memory: null
+    ephemeralStorage: null
+    gpu: false
+  limits:
+    cpu: null
+    memory: null
+    ephemeralStorage: null
+
+  ingress:
+    enabled: true
+    url: null               # set by CI: --set app.ingress.url

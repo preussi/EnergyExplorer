@@ -1,0 +1,73 @@
+# Helm values for the EnergyExplorer FastAPI backend (IVIA generic chart).
+# Declare variables to be passed into your templates.
+
+app:
+  image:
+    repository: null      # set by CI: --set app.image.repository
+    tag: latest           # set by CI: --set app.image.tag
+    pullPolicy: Always
+
+  # either StatefulSet, Deployment, or Job
+  type: Deployment
+
+  replicaCount: 1
+
+  # The container listens on 8000 (uvicorn, see backend/Dockerfile).
+  port: 8000
+
+  # Liveness/readiness path (FastAPI route in app/main.py).
+  health: "/api/health"
+
+  updateStrategy: Recreate
+
+  # The sample data is baked into the image, so no data volume is needed.
+  extraEnv:
+    PYTHONUNBUFFERED: "1"
+
+  readinessProbe: |
+    httpGet:
+      path: {{ .Values.app.health }}
+      {{- if eq (typeOf .Values.app.port) "[]interface {}" }}
+      port: {{ first .Values.app.port }}
+      {{- else }}
+      port: {{ .Values.app.port }}
+      {{- end }}
+    initialDelaySeconds: 3
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+
+  livenessProbe: |
+    httpGet:
+      path: {{ .Values.app.health }}
+      {{- if eq (typeOf .Values.app.port) "[]interface {}" }}
+      port: {{ first .Values.app.port }}
+      {{- else }}
+      port: {{ .Values.app.port }}
+      {{- end }}
+    initialDelaySeconds: 6
+    timeoutSeconds: 5
+    periodSeconds: 5
+    failureThreshold: 4
+    successThreshold: 1
+
+  startupProbe: null
+
+  requests:
+    cpu: null
+    memory: null
+    ephemeralStorage: null
+    gpu: false
+  limits:
+    cpu: null
+    memory: null
+    ephemeralStorage: null
+
+  # No persistent volumes: data is in the image, the projection cache is
+  # ephemeral (PCA runs live; t-SNE/UMAP return 425 until a cache is built).
+  pvcs: []
+
+  ingress:
+    enabled: true
+    url: null               # set by CI: --set app.ingress.url

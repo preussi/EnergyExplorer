@@ -1,31 +1,19 @@
 services:
   backend:
     build: ./backend
+    # The sample data is baked into the image (see backend/Dockerfile). Only the
+    # projection cache is mounted so t-SNE/UMAP builds persist across rebuilds.
     volumes:
-      - ./data:/data:ro
       - ./backend/cache:/app/cache
-    environment:
-      DATA_DIR: /data
-      CACHE_DIR: /app/cache
     ports:
       - "8000:8000"
 
   frontend:
     build: ./frontend
+    environment:
+      # nginx proxies /api to this target (the backend compose service).
+      BACKEND_URL: http://backend:8000
     ports:
       - "5173:80"
     depends_on:
       - backend
-
-  # db:                       # phase 3 — uncomment when persistence is needed
-  #   image: postgres:16
-  #   environment:
-  #     POSTGRES_PASSWORD: dev
-  #     POSTGRES_DB: energy
-  #   volumes:
-  #     - pgdata:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-
-# volumes:
-#   pgdata:

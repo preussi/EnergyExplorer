@@ -380,7 +380,7 @@ any technology (phys or norm units), or chain id.
 docker compose up --build            # frontend :5173 · backend :8000 (/docs)
 
 # local dev loop (hot reload)
-cd backend && $env:DATA_DIR="../data"; python -m uvicorn app.main:app --reload --port 8000
+cd backend && $env:DATA_DIR="./data"; python -m uvicorn app.main:app --reload --port 8000
 cd frontend && npm run dev           # Vite proxies /api → 127.0.0.1:8000
 
 # quality gates
