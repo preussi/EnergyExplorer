@@ -265,7 +265,12 @@ verify:
     - ivialab-aks-cluster
   image: curlimages/curl:8.6.0
   before_script:
-    - alias curl='curl -v --fail --connect-timeout 10 --max-time 10 --retry 20 --retry-delay 10 --retry-max-time 120'
+    # --retry-all-errors lets curl retry TLS-verification failures (exit 60),
+    # so a fresh deploy waits out the cert-manager / Let's Encrypt issuance
+    # window (the ingress serves nginx's self-signed "Fake Certificate" until
+    # the real cert is provisioned) instead of failing instantly. TLS is still
+    # fully validated — only a real, publicly-trusted cert makes this pass.
+    - alias curl='curl -v --fail --connect-timeout 10 --max-time 15 --retry 60 --retry-delay 10 --retry-all-errors --retry-max-time 600'
   script:
     # Verify the apps are reachable.
     - curl https://$URL_FULL
