@@ -182,6 +182,75 @@ def shadow_pairs(ds):
     return out
 
 
+# sampler -> dependence matrices (computed once per sampler on a subsample)
+_DEPENDENCE_CACHE: dict[str, dict] = {}
+_DEPENDENCE_N = 1500   # subsample size: distance correlation is O(n^2) in memory
+
+
+def _double_centered(x: np.ndarray) -> np.ndarray:
+    """Double-centered pairwise-distance matrix of a 1-D variable (for dCov)."""
+    D = np.abs(x[:, None] - x[None, :])
+    return D - D.mean(0, keepdims=True) - D.mean(1, keepdims=True) + D.mean()
+
+
+def dependence(ds, sampler: str, n: int = _DEPENDENCE_N) -> dict:
+    """Pairwise statistical dependence between the 10 axes, three ways:
+
+    - **distance correlation** (dcor): 0 iff independent, [0,1], catches nonlinear /
+      non-monotonic coupling. The statistical analogue of the geometric facet
+      'boxiness' — what actually trades off in the uniform near-optimal cloud.
+    - **mutual information** (mi): k-NN (KSG-style) estimate, no binning; raw nats.
+    - **pearson**: the linear baseline (near-useless here — included for contrast).
+
+    All three are affine-invariant per axis, so normalized vs physical units give
+    identical results; computed on a deterministic subsample (dCor is O(n^2)).
+    Cached per sampler (the samples are static)."""
+    if sampler in _DEPENDENCE_CACHE:
+        return _DEPENDENCE_CACHE[sampler]
+
+    X_full = ds.get_samples(sampler, "norm")          # (N, 10)
+    N, d = X_full.shape
+    rng = np.random.default_rng(42)
+    idx = np.sort(rng.choice(N, size=min(n, N), replace=False))
+    X = X_full[idx]                                   # (n, 10)
+
+    # ---- distance correlation: one double-centered matrix per axis, then every
+    # pair is a cheap elementwise-product mean (dCov^2). ----
+    A = [_double_centered(X[:, k]) for k in range(d)]
+    dvar2 = np.array([float((A[k] * A[k]).mean()) for k in range(d)])
+    dcor = np.eye(d)
+    for i in range(d):
+        for j in range(i + 1, d):
+            dcov2 = float((A[i] * A[j]).mean())
+            denom = np.sqrt(dvar2[i] * dvar2[j])
+            v = np.sqrt(max(dcov2, 0.0) / denom) if denom > 0 else 0.0
+            dcor[i, j] = dcor[j, i] = v
+
+    # ---- mutual information: k-NN estimator, per target column ----
+    from sklearn.feature_selection import mutual_info_regression
+    mi = np.zeros((d, d))
+    for k in range(d):
+        col = mutual_info_regression(X, X[:, k], discrete_features=False,
+                                     n_neighbors=3, random_state=42)
+        mi[k] = col
+    mi = (mi + mi.T) / 2.0           # symmetrize the estimator
+    np.fill_diagonal(mi, 0.0)        # self-MI (entropy) is not comparable; drop it
+
+    # ---- pearson (linear baseline) ----
+    pearson = np.corrcoef(X, rowvar=False)
+
+    result = {
+        "sampler": sampler,
+        "axes": ds.axes,
+        "n": int(X.shape[0]),
+        "dcor": dcor.tolist(),
+        "mi": mi.tolist(),
+        "pearson": pearson.tolist(),
+    }
+    _DEPENDENCE_CACHE[sampler] = result
+    return result
+
+
 def flexibility(ds, constraints=None):
     """Exact remaining feasible [min, max] of every axis under the user's
     constraints (two LPs per axis), in physical units. The MGA 'how far can each

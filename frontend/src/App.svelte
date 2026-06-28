@@ -1,9 +1,10 @@
 <script lang="ts">
   import {
     getMeta, getProjection, getColor, getSamples, getClusters, getExtremes, generate,
-    getFlexibility,
+    getFlexibility, getDependence, getShadowPairs,
     type Meta, type Projection, type ColorData, type SamplesData, type ClustersData,
     type GenerateResult, type ConstraintInput, type ExtremeDesign, type FlexRange,
+    type Dependence, type DependenceMetric, type ShadowPair,
   } from "./lib/api";
   import ScatterGL from "./lib/ScatterGL.svelte";
   import ParallelCoords from "./lib/ParallelCoords.svelte";
@@ -11,6 +12,7 @@
   import FacetView from "./lib/FacetView.svelte";
   import FlexBars from "./lib/FlexBars.svelte";
   import StarWheel from "./lib/StarWheel.svelte";
+  import DependenceMatrix from "./lib/DependenceMatrix.svelte";
 
   let meta = $state<Meta | null>(null);
   let proj = $state<Projection | null>(null);
@@ -19,10 +21,14 @@
   let clustersData = $state<ClustersData | null>(null);
   let extremesData = $state<ExtremeDesign[]>([]);
 
+  // Cap how many designs are rendered. The 20k full set is visually overwhelming;
+  // the backend downsamples deterministically (seeded), and color / parallel-coords
+  // / normalized-tech are all gathered through proj.index so the views stay aligned.
+  const DISPLAY_N = 10000;
+
   let method = $state("pca");
   let sampler = $state("chrrt");
   let field = $state("net_present_cost");
-  let space = $state("phys");
   let showOptimum = $state(true);
   let showClusters = $state(true);
 
@@ -46,7 +52,13 @@
   let mode = $state<"pan" | "select">("pan");
 
   // ---- view mode: projection map vs exact facet (shadow) views ----
-  let viewMode = $state<"map" | "facets">("map");
+  let viewMode = $state<"map" | "facets" | "coupling">("map");
+  // pairwise dependence (dCor / MI / Pearson) for the Coupling tab + facet ranking
+  let depData = $state<Dependence | null>(null);
+  let depMetric = $state<DependenceMetric>("dcor");
+  let shadowPairs = $state<ShadowPair[]>([]);   // boxiness per pair (for the dCor-vs-boxiness check)
+  // a pair to open in the Facets tab (set by clicking a heatmap cell)
+  let facetSel = $state<{ x: string; y: string } | null>(null);
 
   // ---- star coordinates (user-steered linear projection) ----
   const isStar = $derived(method === "star");
@@ -63,7 +75,7 @@
     try {
       const r = await getSamples(s, tech, "norm");
       if (s === sampler) normTech = r.values;
-    } catch (e) { error = (e as Error).message; }
+    } catch (e) { console.warn("normTech load failed:", e); }
   }
   function pcaAnchors(): [number, number][] {
     if (!proj?.components) return circleAnchors();
@@ -91,6 +103,24 @@
     const maxN = Math.max(...un.map((_, j) => Math.hypot(un[j], vn[j]))) || 1;
     return un.map((_, j) => [(un[j] / maxN) * 0.85, (vn[j] / maxN) * 0.85]);
   }
+  // Gram-Schmidt the two columns (x-/y-components across axes) of the anchor
+  // frame back to orthonormal, then rescale to a 0.85 radius. Keeps every toured
+  // frame *area-true* (a real grand tour) instead of squishing through the linear
+  // interpolation between two orthonormal frames.
+  function orthonormalizeAnchors(anchors: [number, number][]): [number, number][] {
+    const n = anchors.length;
+    let f1 = anchors.map((a) => a[0]);
+    let f2 = anchors.map((a) => a[1]);
+    const dot = (u: number[], v: number[]) => u.reduce((s, x, j) => s + x * v[j], 0);
+    const nrm = (v: number[]) => Math.sqrt(dot(v, v)) || 1;
+    f1 = f1.map((x) => x / nrm(f1));
+    const d = dot(f2, f1);
+    f2 = f2.map((x, j) => x - d * f1[j]);
+    f2 = f2.map((x) => x / nrm(f2));
+    const anc = Array.from({ length: n }, (_, j) => [f1[j], f2[j]] as [number, number]);
+    const maxN = Math.max(...anc.map((a) => Math.hypot(a[0], a[1]))) || 1;
+    return anc.map((a) => [(a[0] / maxN) * 0.85, (a[1] / maxN) * 0.85] as [number, number]);
+  }
   function toggleTour() {
     if (touring) {
       touring = false;
@@ -100,16 +130,52 @@
     touring = true;
     tourTarget = randomFrame();
     tourTimer = setInterval(() => {
-      let maxd = 0;
-      starAnchors = starAnchors.map((a, j) => {
+      const lerped = starAnchors.map((a, j) => {
         const t = tourTarget[j] ?? a;
-        const nx = a[0] + (t[0] - a[0]) * 0.045;
-        const ny = a[1] + (t[1] - a[1]) * 0.045;
-        maxd = Math.max(maxd, Math.hypot(t[0] - nx, t[1] - ny));
-        return [nx, ny] as [number, number];
+        return [a[0] + (t[0] - a[0]) * 0.045, a[1] + (t[1] - a[1]) * 0.045] as [number, number];
       });
+      starAnchors = orthonormalizeAnchors(lerped);
+      let maxd = 0;
+      for (let j = 0; j < starAnchors.length; j++) {
+        const t = tourTarget[j] ?? starAnchors[j];
+        maxd = Math.max(maxd, Math.hypot(t[0] - starAnchors[j][0], t[1] - starAnchors[j][1]));
+      }
       if (maxd < 0.02) tourTarget = randomFrame();
     }, 50);
+  }
+  // Direct manipulation: drag a design (a pin or the optimum) and rotate the
+  // whole projection so that design moves toward the cursor — the Grand Tour's
+  // "data-point mode". We nudge each frame column by a multiple of the dragged
+  // design's tech vector, then re-orthonormalize (keeps it area-true).
+  function rotateFrameToward(t: number[], qx: number, qy: number) {
+    if (!starAnchors.length) return;
+    const tn = Math.hypot(...t);
+    if (tn < 1e-6) return;
+    const tu = t.map((x) => x / tn);
+    let f1 = starAnchors.map((a) => a[0]);
+    let f2 = starAnchors.map((a) => a[1]);
+    const cur1 = f1.reduce((s, x, j) => s + x * t[j], 0);
+    const cur2 = f2.reduce((s, x, j) => s + x * t[j], 0);
+    const DAMP = 0.5; // ease toward the cursor so the drag feels smooth
+    const a = ((cur1 + (qx - cur1) * DAMP) - cur1) / tn;
+    const b = ((cur2 + (qy - cur2) * DAMP) - cur2) / tn;
+    f1 = f1.map((x, j) => x + a * tu[j]);
+    f2 = f2.map((x, j) => x + b * tu[j]);
+    starAnchors = orthonormalizeAnchors(
+      Array.from({ length: f1.length }, (_, j) => [f1[j], f2[j]] as [number, number]),
+    );
+  }
+  function onMarkerDrag(kind: string, id: number, qx: number, qy: number) {
+    if (!isStar || !starAnchors.length || !meta) return;
+    if (touring) toggleTour(); // a manual grab pauses the auto-tour
+    let t: number[] | null = null;
+    if (kind === "optimum") {
+      const ci = meta.axes.indexOf(meta.cost_axis);
+      t = meta.optimum.norm.filter((_, k) => k !== ci);
+    } else {
+      t = pins.find((p) => p.id === id)?.normTech ?? null;
+    }
+    if (t) rotateFrameToward(t, qx, qy);
   }
   // initialize anchors the first time star mode is ready (circle layout: every
   // handle is grabbable; PCA loadings would bunch most anchors at the center)
@@ -119,9 +185,9 @@
     }
   });
   const starPoints = $derived.by(() => {
-    if (!isStar || !normTech || !starAnchors.length) return [];
+    if (!isStar || !dispNormTech || !starAnchors.length) return [];
     const A = starAnchors;
-    return normTech.map((row) => {
+    return dispNormTech.map((row) => {
       let x = 0, y = 0;
       for (let j = 0; j < A.length; j++) { x += row[j] * A[j][0]; y += row[j] * A[j][1]; }
       return [x, y];
@@ -178,7 +244,7 @@
       `${inCandidates ? "cand" : "#"}${i}`,
       dispValues[i],
       dispPoints[i] as [number, number],
-      !inCandidates ? normTech?.[i] : undefined,
+      !inCandidates ? dispNormTech?.[i] : undefined,
     );
   }
   function pinOptimum() {
@@ -346,18 +412,24 @@
 
   async function loadProjection() {
     loading = true; error = null;
-    try { proj = await getProjection(fetchMethod, sampler, 2); }
+    try { proj = await getProjection(fetchMethod, sampler, 2, DISPLAY_N); }
     catch (e) { error = (e as Error).message; proj = null; }
     finally { loading = false; }
   }
   async function loadColor() {
-    try { colorData = await getColor(sampler, field, space); }
-    catch (e) { error = (e as Error).message; }
+    // Color is always fetched in physical units. (Color is min-max normalized,
+    // and phys = scale*norm + offset per axis, so normalized vs physical produce
+    // identical colors — only the legend's numeric bounds would differ. Physical
+    // shows real magnitudes, so there's no separate unit toggle.)
+    // A secondary fetch: a transient failure shouldn't blank the whole view with
+    // a blocking error (the scatter still renders). Only the projection/meta do.
+    try { colorData = await getColor(sampler, field, "phys"); }
+    catch (e) { console.warn("color load failed:", e); }
   }
   async function loadSamples() {
     if (!meta) return;
     try { samples = await getSamples(sampler, meta.axes, "phys"); }
-    catch (e) { error = (e as Error).message; }
+    catch (e) { console.warn("samples load failed:", e); }
   }
   async function loadClusters() {
     try { clustersData = await getClusters(fetchMethod, sampler, 6); }
@@ -366,6 +438,11 @@
   async function loadExtremes() {
     try { extremesData = (await getExtremes(sampler)).extremes; }
     catch { extremesData = []; }
+  }
+  async function loadDependence() {
+    const s = sampler;
+    try { const r = await getDependence(s); if (s === sampler) depData = r; }
+    catch { depData = null; }
   }
 
   function onSamplerOrMethod() {
@@ -377,6 +454,16 @@
     if (method === "star") ensureNormTech();
     loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
   }
+
+  // dependence depends only on the sampler — (re)load when it changes
+  $effect(() => {
+    sampler;
+    if (meta) loadDependence();
+  });
+  // shadow-pair boxiness is sampler-independent (static polytope) — fetch once
+  $effect(() => {
+    if (meta && !shadowPairs.length) getShadowPairs().then((r) => (shadowPairs = r.pairs)).catch(() => {});
+  });
 
   const clusterMarkers = $derived(
     (clustersData?.clusters ?? []).map((c) => {
@@ -430,6 +517,14 @@
 
   // ---- what the views currently display (candidates / star / full space) ----
   const inCandidates = $derived(!!candidates);
+  // Row ids of the rendered subset (full-space view only; candidates carry their
+  // own arrays). The full-set arrays (samples / color / normTech) are gathered
+  // through this, so dispPoints[i] / dispValues[i] / dispColorValues[i] /
+  // dispNormTech[i] all refer to the same design i — selection stays positional.
+  const subIndex = $derived(!candidates && proj ? proj.index : null);
+  const dispNormTech = $derived(
+    subIndex && normTech ? subIndex.map((r) => normTech![r]) : normTech,
+  );
   const dispPoints = $derived(
     candidates ? candidates.points : isStar ? starPoints : (proj?.points ?? []),
   );
@@ -437,12 +532,19 @@
     !candidates && isStar ? starOptimum : (proj?.optimum ?? null),
   );
   const dispFields = $derived(candidates ? candidates.fields : (samples?.fields ?? []));
-  const dispValues = $derived(candidates ? candidates.values : (samples?.values ?? []));
+  const dispValues = $derived.by(() => {
+    if (candidates) return candidates.values;
+    const v = samples?.values ?? [];
+    return subIndex && v.length ? subIndex.map((r) => v[r]) : v;
+  });
   const colorIdx = $derived(
     dispFields.indexOf(field === "chain" ? "net_present_cost" : field),
   );
   const dispColorValues = $derived.by(() => {
-    if (!candidates) return colorData?.values ?? [];
+    if (!candidates) {
+      const v = colorData?.values ?? [];
+      return subIndex && v.length ? subIndex.map((r) => v[r]) : v;
+    }
     if (colorIdx < 0) return [];
     return candidates.values.map((r) => r[colorIdx]);
   });
@@ -509,11 +611,10 @@
   );
 
   // ---- hover tooltip ----
-  const hoverRow = $derived(
-    hoverIdx === null ? null
-    : candidates ? hoverIdx
-    : proj ? proj.index[hoverIdx] : null,
-  );
+  // hoverIdx is the position within the rendered arrays; dispValues / dispPoints
+  // are aligned to it, so the tooltip indexes by hoverRow directly. The original
+  // design id (for the label) is recovered via subIndex.
+  const hoverRow = $derived(hoverIdx);
   function onMove(e: MouseEvent) {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     mouse = [e.clientX - r.left, e.clientY - r.top];
@@ -535,30 +636,47 @@
     <div class="seg view-seg">
       <button class:active={viewMode === "map"} onclick={() => (viewMode = "map")}>Map</button>
       <button class:active={viewMode === "facets"} onclick={() => (viewMode = "facets")}>Facets</button>
+      <button class:active={viewMode === "coupling"} onclick={() => (viewMode = "coupling")}>Coupling</button>
     </div>
     {#if proj && viewMode === "map"}
       <span class="topbar-hint">
         {mode === "select" ? "drag to lasso-select" : "scroll to zoom · drag to pan · click a point to pin"}
+        {#if isStar} · drag ◯ / pins to rotate the projection{/if}
         {#if !isMetric} · {method.toUpperCase()} axes are non-metric{/if}
       </span>
     {:else if viewMode === "facets"}
       <span class="topbar-hint">exact trade-off boundaries of the near-optimal space · brush below to constrain</span>
+    {:else if viewMode === "coupling"}
+      <span class="topbar-hint">nonlinear dependence between axes (distance correlation / mutual information) · click a cell → its facet</span>
     {/if}
   </header>
 
   <!-- borderless graph between the panels -->
-  {#if viewMode === "facets"}
+  {#if viewMode === "coupling"}
     <div class="graph-region">
-      {#if samples}
+      <DependenceMatrix
+        dep={depData}
+        pairs={shadowPairs}
+        metric={depMetric}
+        onmetric={(m) => (depMetric = m)}
+        onpair={(x, y) => { facetSel = { x, y }; viewMode = "facets"; }}
+      />
+    </div>
+  {:else if viewMode === "facets"}
+    <div class="graph-region">
+      {#if dispFields.length}
         <FacetView
-          fields={samples.fields}
-          values={samples.values}
-          colorValues={colorData?.values ?? []}
-          colorCategorical={colorData?.categorical ?? false}
-          colorMin={colorData?.min ?? 0}
-          colorMax={colorData?.max ?? 1}
+          fields={dispFields}
+          values={dispValues}
+          colorValues={dispColorValues}
+          colorCategorical={dispCategorical}
+          colorMin={dispColorMin}
+          colorMax={dispColorMax}
           constraints={allConstraints}
           selected={candidates ? null : selected}
+          dependence={depData}
+          selectPair={facetSel}
+          onconsumepair={() => (facetSel = null)}
         />
       {/if}
     </div>
@@ -588,6 +706,8 @@
         onselect={(idx) => (selected = idx.length ? idx : null)}
         onpin={pinRow}
         onspoke={pinExtreme}
+        draggableMarkers={isStar && !inCandidates}
+        onmarkerdrag={onMarkerDrag}
       />
       <div class="ylabel">{axisLabel(1)}</div>
       <div class="xlabel">{axisLabel(0)}</div>
@@ -610,7 +730,7 @@
   <!-- tooltip floats above every panel -->
   {#if hoverRow !== null && dispValues[hoverRow]}
     <div class="tooltip" style="left:{mouse[0] + 14}px; top:{mouse[1] + 14}px">
-      <div class="tt-title">{inCandidates ? "candidate" : "design"} #{hoverRow}</div>
+      <div class="tt-title">{inCandidates ? "candidate" : "design"} #{!inCandidates && subIndex ? subIndex[hoverRow] : hoverRow}</div>
       {#each dispFields as f, j}
         <div class="tt-row" class:cost={f === "net_present_cost"}>
           <span>{short(f)}</span><span>{fmt(dispValues[hoverRow][j])}</span>
@@ -654,12 +774,6 @@
       <select bind:value={field} onchange={loadColor}>
         {#each meta?.axes ?? [] as a}<option value={a}>{a}</option>{/each}
         <option value="chain">chain (sampler diagnostic)</option>
-      </select>
-    </label>
-    <label>Units (for color)
-      <select bind:value={space} onchange={loadColor} disabled={field === "chain"}>
-        <option value="phys">physical</option>
-        <option value="norm">normalized</option>
       </select>
     </label>
     <label class="check">
@@ -755,7 +869,7 @@
     </div>
 
     <div class="info">
-      {#if meta}<p><strong>{meta.n_samples.toLocaleString()}</strong> samples · {meta.axes.length} dims</p>{/if}
+      {#if meta}<p><strong>{Math.min(DISPLAY_N, meta.n_samples).toLocaleString()}</strong> of {meta.n_samples.toLocaleString()} samples shown · {meta.axes.length} dims</p>{/if}
       {#if proj}<p class="muted">{proj.cached ? "cached" : "live"} {proj.method.toUpperCase()} · optimum {proj.optimum ? "shown" : "n/a"}</p>{/if}
     </div>
 

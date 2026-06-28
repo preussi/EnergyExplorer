@@ -52,8 +52,23 @@ export interface ColorData {
   categorical: boolean;
 }
 
+// Retry only when fetch() itself rejects — a network-level blip ("Failed to
+// fetch": server restart, dropped/aborted connection). HTTP errors (4xx/5xx)
+// resolve and are handled by the callers, so a real 425/400 is never retried.
+async function fetchRetry(url: string, init?: RequestInit, retries = 1): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 400));
+      return fetchRetry(url, init, retries - 1);
+    }
+    throw e;
+  }
+}
+
 async function getJSON<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await fetchRetry(url);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail ?? `${res.status} ${res.statusText}`);
@@ -62,7 +77,7 @@ async function getJSON<T>(url: string): Promise<T> {
 }
 
 async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetchRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -160,6 +175,21 @@ export interface Flexibility {
 
 export function getShadowPairs(): Promise<{ pairs: ShadowPair[] }> {
   return getJSON("/api/shadow_pairs");
+}
+
+export type DependenceMetric = "dcor" | "mi" | "pearson";
+
+export interface Dependence {
+  sampler: string;
+  axes: string[];
+  n: number;
+  dcor: number[][];    // distance correlation, [0,1], 0 iff independent
+  mi: number[][];      // mutual information (nats), k-NN estimate
+  pearson: number[][]; // linear baseline, [-1,1]
+}
+
+export function getDependence(sampler: string): Promise<Dependence> {
+  return getJSON<Dependence>(`/api/dependence?${new URLSearchParams({ sampler })}`);
 }
 
 export function getShadow(

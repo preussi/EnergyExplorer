@@ -1,8 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { scaleLinear } from "d3-scale";
-  import { getShadowPairs, getShadow, type Shadow, type ShadowPair, type ConstraintInput } from "./api";
+  import { getShadowPairs, getShadow, type Shadow, type ShadowPair, type ConstraintInput,
+           type Dependence, type DependenceMetric } from "./api";
   import { colorFor } from "./colors";
+
+  type RankMetric = "boxiness" | DependenceMetric;
 
   // Facet views: the exact 2-D shadow (orthogonal projection) of the near-optimal
   // polytope per axis pair — boundaries computed by LPs on the backend, samples
@@ -16,6 +19,9 @@
     colorMax = 1,
     constraints = [],
     selected = null,
+    dependence = null,
+    selectPair = null,
+    onconsumepair,
   }: {
     fields: string[];
     values: number[][]; // physical, all axes (sample rows)
@@ -25,6 +31,9 @@
     colorMax?: number;
     constraints?: ConstraintInput[];
     selected?: number[] | null;
+    dependence?: Dependence | null;     // dCor/MI/Pearson, for alternative rankings
+    selectPair?: { x: string; y: string } | null;  // one-shot drill-down from the heatmap
+    onconsumepair?: () => void;         // ask the parent to clear selectPair once applied
   } = $props();
 
   const SHORT: Record<string, string> = {
@@ -40,6 +49,37 @@
   let pairs = $state<ShadowPair[]>([]);
   let pairsLoading = $state(true);
   let sel = $state<{ x: string; y: string } | null>(null);
+  let rankMetric = $state<RankMetric>("boxiness");
+
+  // Re-rank the 45 pairs: boxiness ascending (most structured first) or, when a
+  // dependence matrix is available, by |dCor|/|MI|/|Pearson| descending (strongest
+  // coupling first). Same geometric small-multiples, different ordering lens.
+  const rankedPairs = $derived.by(() => {
+    const ps = pairs.slice();
+    if (rankMetric === "boxiness" || !dependence)
+      return ps.sort((a, b) => (a.boxiness ?? 1) - (b.boxiness ?? 1));
+    const m = rankMetric;
+    const val = (p: ShadowPair) => {
+      const i = dependence!.axes.indexOf(p.x), j = dependence!.axes.indexOf(p.y);
+      return i >= 0 && j >= 0 ? Math.abs(dependence![m][i][j]) : 0;
+    };
+    return ps.sort((a, b) => val(b) - val(a));
+  });
+  function scoreOf(p: ShadowPair): string {
+    if (rankMetric === "boxiness" || !dependence)
+      return p.boxiness == null ? "" : `${Math.round((1 - p.boxiness) * 100)}%`;
+    const i = dependence.axes.indexOf(p.x), j = dependence.axes.indexOf(p.y);
+    return i >= 0 && j >= 0 ? dependence[rankMetric][i][j].toFixed(2) : "";
+  }
+
+  // drill-down: a pair picked in the Coupling heatmap selects it here. selectPair
+  // is a one-shot command — apply it, then ask the parent to clear it. Critically,
+  // this effect depends only on selectPair (it never reads `sel`), so clicking
+  // other facet cards afterwards is NOT overridden back to the drilled pair.
+  $effect(() => {
+    const p = selectPair;
+    if (p) { sel = { x: p.x, y: p.y }; onconsumepair?.(); }
+  });
   let baseShadow = $state<Shadow | null>(null);
   let consShadow = $state<Shadow | null>(null);
   let err = $state<string | null>(null);
@@ -151,7 +191,7 @@
   let miniPaths = $state<Record<string, string>>({});
   const requested = new Set<string>();
   $effect(() => {
-    for (const p of pairs.slice(0, 10)) {
+    for (const p of rankedPairs.slice(0, 10)) {
       const key = `${p.x}|${p.y}`;
       if (requested.has(key)) continue;
       requested.add(key);
@@ -166,7 +206,6 @@
     }
   });
 
-  const interest = (b: number | null) => (b == null ? "" : `${Math.round((1 - b) * 100)}%`);
 </script>
 
 <div class="facets">
@@ -208,11 +247,19 @@
   </div>
 
   <div class="rank">
-    <div class="rank-head">facets by structure</div>
+    <div class="rank-head">
+      <span>rank by</span>
+      <select bind:value={rankMetric} aria-label="ranking metric">
+        <option value="boxiness">boxiness</option>
+        <option value="dcor" disabled={!dependence}>dist. corr</option>
+        <option value="mi" disabled={!dependence}>mutual info</option>
+        <option value="pearson" disabled={!dependence}>Pearson</option>
+      </select>
+    </div>
     {#if pairsLoading}
       <span class="muted small">ranking 45 facets… (first run computes 3,240 LPs)</span>
     {/if}
-    {#each pairs.slice(0, 10) as p}
+    {#each rankedPairs.slice(0, 10) as p}
       <button
         class="mini-card"
         class:active={sel?.x === p.x && sel?.y === p.y}
@@ -224,7 +271,7 @@
           {/if}
         </svg>
         <span class="mini-label">{short(p.x)} × {short(p.y)}</span>
-        <span class="mini-score" title="how far from a plain rectangle">{interest(p.boxiness)}</span>
+        <span class="mini-score" title={rankMetric === "boxiness" ? "how far from a plain rectangle" : rankMetric}>{scoreOf(p)}</span>
       </button>
     {/each}
   </div>
@@ -269,7 +316,13 @@
   .small { font-size: 11px; }
 
   .rank { display: flex; flex-direction: column; gap: 7px; overflow-y: auto; min-height: 0; padding-right: 2px; }
-  .rank-head { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .rank-head { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+    display: flex; align-items: center; gap: 6px; }
+  .rank-head select {
+    text-transform: none; letter-spacing: normal; font-size: 11px; padding: 1px 4px;
+    background: rgba(255, 255, 255, 0.05); color: var(--fg);
+    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 5px;
+  }
   .mini-card {
     display: flex; flex-direction: column; align-items: stretch; gap: 2px;
     background: rgba(255, 255, 255, 0.025);

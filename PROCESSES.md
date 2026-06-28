@@ -329,10 +329,53 @@ design with normalized values tⱼ renders at Σⱼ tⱼ·v⃗ⱼ. This is a *li
 projection, so convexity, straight facets, the cost ramp, pins, and A→B paths
 all remain exact (the literature recommends star coordinates over RadViz for
 precisely this reason). Anchors start on a circle; one-click resets to the PCA
-loadings or the circle. The **tour** button animates the anchors toward random
-orthonormal frames (grand-tour style) — moving shadows reveal 3-D+ shape that
-no static projection shows. Implementation: 20k×9 dot products per frame
-(<10 ms); density contours are debounced 220 ms so drags stay fluid.
+loadings or the circle.
+
+**Grand tour (proper).** The **tour** button animates toward random orthonormal
+2-frames, but the interpolation between two frames is itself re-orthonormalized
+every tick (Gram–Schmidt on the frame's two 9-vectors, then rescaled to a fixed
+radius). This keeps every *intermediate* frame area-true — a real grand tour
+(per the Distill 2020 "Grand Tour" guide) rather than a linear blend that squishes
+mid-transition. Moving shadows reveal 3-D+ shape no static projection shows.
+
+**Direct manipulation (drag-to-rotate).** In star mode the optimum ◯ and any
+pinned design are draggable; dragging one rotates the *whole* projection so that
+design follows the cursor (the Distill "data-point mode"). Math: for the dragged
+design's tech vector t, nudge each frame column fₖ by `(q−fₖ·t)/‖t‖ · t̂` toward
+the cursor target q (eased), then re-orthonormalize. Because we only add a
+component along t̂, the other designs move minimally — you "grab" a design and
+swing the space around it. Screen pixels are inverted back to projection space
+through the scatter's live d3 scales.
+
+This linear-projection family is the honest choice for this data (the Grand Tour
+paper's "data-visual correspondence"): a change in one design moves only that
+design, and convexity / straight facets / the cost ramp all stay exact — unlike
+t-SNE/UMAP, where one point's position depends on the whole distribution.
+Implementation: 5k×9 dot products per frame (<10 ms); contours debounced 220 ms.
+
+### 10.11 Coupling matrix (statistical dependence) — the "Coupling" tab
+The Facets tab measures coupling **geometrically** (boxiness of the exact LP
+shadow). The Coupling tab measures it **statistically** from the samples, which
+matters because the linear correlation is nearly useless here (max |Pearson|
+≈ 0.39) while the real couplings are nonlinear (polytope facets/corners). Three
+pairwise measures over the 10 axes (`GET /api/dependence`, cached per sampler,
+computed on a 1,500-point subsample since distance correlation is O(n²)):
+- **Distance correlation** (default) — `dCor ∈ [0,1]`, **0 iff independent**,
+  catches nonlinear/non-monotonic dependence. Computed from double-centered
+  pairwise-distance matrices: one per axis, then each pair is a cheap
+  `mean(Aᵢ∘Aⱼ)` (dCov²) normalized by the distance variances. The statistical
+  analogue of facet boxiness.
+- **Mutual information** — k-NN (KSG-style) estimator (`mutual_info_regression`,
+  no binning), symmetrized; surfaces couplings dCor/Pearson rank lower (e.g.
+  DAC×battery).
+- **Pearson** — the linear baseline, for contrast.
+
+All three are affine-invariant per axis, so normalized vs physical units give
+identical results. The heatmap cell click opens that pair as an exact Facet, and
+the Facets tab's ranking dropdown can re-sort the 45 pairs by any of these
+instead of boxiness. A companion scatter plots **dCor vs (1 − boxiness)** per
+pair: the up-right trend is a built-in cross-check that the sampled cloud's
+dependence matches the polytope's exact facet structure (a sampler sanity test).
 
 ## 11. Interaction model
 
@@ -369,6 +412,7 @@ any technology (phys or norm units), or chain id.
 | `/api/clusters?method&sampler&k` | GET | k-means region centroids + z-score characterization |
 | `/api/extremes?sampler` | GET | 18 LP extreme designs (values, cost, PCA coords) |
 | `/api/shadow_pairs` | GET | all 45 axis pairs ranked by shadow boxiness (cached) |
+| `/api/dependence?sampler` | GET | 10×10 distance-correlation, mutual-information & Pearson matrices (cached, 1.5k subsample) |
 | `/api/shadow` | POST | exact 2-D shadow polygon of the (constrained) polytope |
 | `/api/flexibility` | POST | exact remaining [min,max] per axis under constraints |
 | `/api/generate` | POST | constraints → feasibility LP → hit-and-run candidates + PCA coords |

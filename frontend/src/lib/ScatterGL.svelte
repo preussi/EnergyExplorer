@@ -37,10 +37,12 @@
     walkActive = false,
     selected = null,
     mode = "pan",
+    draggableMarkers = false,
     onhover,
     onselect,
     onpin,
     onspoke,
+    onmarkerdrag,
   }: {
     points: number[][];
     color: number[];
@@ -60,10 +62,12 @@
     walkActive?: boolean;
     selected?: number[] | null;
     mode?: "pan" | "select";
+    draggableMarkers?: boolean;   // star mode: drag the optimum / pins to rotate the projection
     onhover?: (index: number | null) => void;
     onselect?: (indices: number[]) => void;
     onpin?: (index: number) => void;
     onspoke?: (key: string) => void;
+    onmarkerdrag?: (kind: string, id: number, dataX: number, dataY: number) => void;
   } = $props();
 
   let container: HTMLDivElement;
@@ -74,7 +78,7 @@
   // ---- screen-space overlay state (written only by positionOverlays) ----
   let optPx = $state<[number, number] | null>(null);
   let clusterPx = $state<{ x: number; y: number; label: string; count: number }[]>([]);
-  let pinPx = $state<{ x: number; y: number; letter: string; color: string }[]>([]);
+  let pinPx = $state<{ x: number; y: number; letter: string; color: string; id: number }[]>([]);
   let spokePx = $state<{ x1: number; y1: number; x2: number; y2: number; label: string; key: string }[]>([]);
   let arrowPx = $state<{ x1: number; y1: number; x2: number; y2: number; label: string }[]>([]);
   let pathPx = $state<{ x1: number; y1: number; x2: number; y2: number; mx: number; my: number } | null>(null);
@@ -85,10 +89,14 @@
   const yScale = scaleLinear().domain([-1, 1]);
 
   // data-space normalization (recomputed per dataset)
+  const PAD = 0.05;
   let nx = (v: number) => v;
   let ny = (v: number) => v;
   let dataCentroid: [number, number] = [0, 0];
   let dataSpan = 1;
+  // raw data bounds, kept so screen pixels can be inverted back to data space
+  // (for drag-to-rotate in star mode)
+  let bx0 = 0, bx1 = 1, by0 = 0, by1 = 1;
 
   const CONTOUR_GRID = 512;
 
@@ -104,12 +112,41 @@
       minX = Math.min(minX, optimum[0]); maxX = Math.max(maxX, optimum[0]);
       minY = Math.min(minY, optimum[1]); maxY = Math.max(maxY, optimum[1]);
     }
-    const pad = 0.05;
-    nx = (v: number) => (((v - minX) / (maxX - minX || 1)) * 2 - 1) * (1 - pad);
-    ny = (v: number) => (((v - minY) / (maxY - minY || 1)) * 2 - 1) * (1 - pad);
+    nx = (v: number) => (((v - minX) / (maxX - minX || 1)) * 2 - 1) * (1 - PAD);
+    ny = (v: number) => (((v - minY) / (maxY - minY || 1)) * 2 - 1) * (1 - PAD);
     dataCentroid = [(minX + maxX) / 2, (minY + maxY) / 2];
     dataSpan = Math.min(maxX - minX, maxY - minY) || 1;
+    bx0 = minX; bx1 = maxX; by0 = minY; by1 = maxY;
   }
+
+  // invert a screen pixel (relative to the container) back to data coordinates —
+  // the reverse of scales(); used by drag-to-rotate. Returns null until ready.
+  function invScales(): [(px: number) => number, (py: number) => number] | null {
+    const xs = scatter?.get("xScale");
+    const ys = scatter?.get("yScale");
+    if (!xs || !ys) return null;
+    const nxInv = (c: number) => bx0 + ((c / (1 - PAD) + 1) / 2) * (bx1 - bx0);
+    const nyInv = (c: number) => by0 + ((c / (1 - PAD) + 1) / 2) * (by1 - by0);
+    return [(px: number) => nxInv(xs.invert(px)), (py: number) => nyInv(ys.invert(py))];
+  }
+
+  // ---- marker drag (drag-to-rotate the star projection) ----
+  let markerDrag: { kind: string; id: number } | null = null;
+  function startMarkerDrag(e: PointerEvent, kind: string, id: number) {
+    if (!draggableMarkers) return;
+    e.stopPropagation();
+    e.preventDefault();
+    markerDrag = { kind, id };
+    (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+  }
+  function moveMarkerDrag(e: PointerEvent) {
+    if (!markerDrag || !container) return;
+    const inv = invScales();
+    if (!inv) return;
+    const r = container.getBoundingClientRect();
+    onmarkerdrag?.(markerDrag.kind, markerDrag.id, inv[0](e.clientX - r.left), inv[1](e.clientY - r.top));
+  }
+  function endMarkerDrag() { markerDrag = null; }
 
   function buildPoints(): number[][] {
     updateNormalizers();
@@ -170,7 +207,7 @@
     clusterPx = showClusters
       ? declutter(clusters.map((c) => ({ x: px(c.x), y: py(c.y), label: c.label, count: c.count })))
       : [];
-    pinPx = pins.map((p) => ({ x: px(p.point[0]), y: py(p.point[1]), letter: p.letter, color: p.color }));
+    pinPx = pins.map((p) => ({ x: px(p.point[0]), y: py(p.point[1]), letter: p.letter, color: p.color, id: p.id }));
 
     spokePx = showSpokes && optimum
       ? spokes.map((s) => ({
@@ -302,9 +339,9 @@
       canvas,
       width: "auto",
       height: "auto",
-      pointSize: 5,
+      pointSize: 3,
       pointSizeSelected: 2,
-      opacity: 0.66,
+      opacity: 0.4,
       backgroundColor: [0, 0, 0, 0],
       xScale,
       yScale,
@@ -436,11 +473,25 @@
   {/each}
 
   {#each pinPx as p}
-    <div class="pin" style="left:{p.x}px; top:{p.y}px; --pc:{p.color}">{p.letter}</div>
+    <div
+      class="pin" class:draggable={draggableMarkers}
+      style="left:{p.x}px; top:{p.y}px; --pc:{p.color}"
+      onpointerdown={(e) => startMarkerDrag(e, "pin", p.id)}
+      onpointermove={moveMarkerDrag}
+      onpointerup={endMarkerDrag}
+      title={draggableMarkers ? "drag to rotate the projection" : ""}
+    >{p.letter}</div>
   {/each}
 
   {#if optPx}
-    <div class="optimum" style="left:{optPx[0]}px; top:{optPx[1]}px" title="Cost optimum (u*)"></div>
+    <div
+      class="optimum" class:draggable={draggableMarkers}
+      style="left:{optPx[0]}px; top:{optPx[1]}px"
+      onpointerdown={(e) => startMarkerDrag(e, "optimum", -1)}
+      onpointermove={moveMarkerDrag}
+      onpointerup={endMarkerDrag}
+      title={draggableMarkers ? "drag to rotate the projection" : "Cost optimum (u*)"}
+    ></div>
   {/if}
 </div>
 
@@ -518,4 +569,8 @@
     content: ""; position: absolute; inset: 5px;
     background: #fff; border-radius: 50%;
   }
+  .pin.draggable, .optimum.draggable {
+    pointer-events: auto; cursor: grab; touch-action: none;
+  }
+  .pin.draggable:active, .optimum.draggable:active { cursor: grabbing; }
 </style>

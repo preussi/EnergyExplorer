@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .data import SAMPLERS, SPACES, get_dataset
+from .generate import dependence as run_dependence
 from .generate import extremes as run_extremes
 from .generate import flexibility as run_flexibility
 from .generate import generate as run_generate
@@ -179,6 +180,17 @@ class ShadowRequest(BaseModel):
 
 class FlexibilityRequest(BaseModel):
     constraints: list[Constraint] = []
+
+
+@app.get("/api/dependence")
+def dependence(sampler: str = Query("chrrt")):
+    """Pairwise dependence between the 10 axes: distance correlation, mutual
+    information, and Pearson. Distance correlation/MI catch the nonlinear coupling
+    that Pearson misses in the uniform near-optimal cloud."""
+    ds = get_dataset()
+    if sampler not in SAMPLERS:
+        raise HTTPException(status_code=400, detail=f"unknown sampler {sampler!r}")
+    return run_dependence(ds, sampler)
 
 
 @app.get("/api/shadow_pairs")
