@@ -27,7 +27,7 @@
   const DISPLAY_N = 10000;
 
   let method = $state("pca");
-  let sampler = $state("chrrt");
+  const sampler = "chrrt"; // sampler choice removed from UI; chrrt is the default view
   let field = $state("net_present_cost");
   let showOptimum = $state(true);
   let showClusters = $state(true);
@@ -452,12 +452,12 @@
     catch { depData = null; }
   }
 
-  function onSamplerOrMethod() {
+  function onMethodChange() {
     selected = null;
     candidates = null; genMsg = null;
     pins = []; stopMorph(); morphT = 0; // pin coords live in the previous projection space
     if (touring) toggleTour();
-    normTech = null; starAnchors = []; // sampler may have changed; refetch/reinit lazily
+    normTech = null; starAnchors = []; // projection changed; refetch/reinit lazily
     if (method === "star") ensureNormTech();
     loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
   }
@@ -761,13 +761,8 @@
 
   <!-- floating control panel (left) -->
   <aside class="hud panel">
-    <label>Sampler
-      <select bind:value={sampler} onchange={onSamplerOrMethod}>
-        {#each meta?.samplers ?? ["chrrt", "har"] as s}<option value={s}>{s}</option>{/each}
-      </select>
-    </label>
     <label>Method
-      <select bind:value={method} onchange={onSamplerOrMethod}>
+      <select bind:value={method} onchange={onMethodChange}>
         {#each meta?.methods ?? ["pca"] as m}<option value={m}>{m.toUpperCase()}</option>{/each}
         <option value="star">STAR ✦ (drag anchors)</option>
       </select>

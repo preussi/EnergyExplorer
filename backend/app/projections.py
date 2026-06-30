@@ -88,7 +88,9 @@ def build_cache(
 
     from sklearn.manifold import TSNE
 
-    samplers = samplers or ["chrrt", "har"]
+    # Only chrrt is exposed in the UI, so by default build the cache for it alone
+    # (halves build time / image size). Pass samplers=[...] to override.
+    samplers = samplers or ["chrrt"]
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     written = []
     for sampler in samplers:
