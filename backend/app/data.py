@@ -19,12 +19,35 @@ SPACES = ("norm", "phys")
 COST_AXIS = "net_present_cost"
 
 
+def _resolve(data_dir: Path, stem: str, exclude: str = "") -> Path:
+    """Find `{stem}.npz`, else the newest versioned `{stem}_*.npz`.
+
+    The upstream data is delivered as versioned files (e.g. `polytope_08.npz`),
+    so we pick the highest suffix rather than hardcoding a name. `exclude` drops
+    siblings whose name contains it (so the `polytope` glob ignores
+    `polytope_samples_*`).
+    """
+    exact = data_dir / f"{stem}.npz"
+    if exact.exists():
+        return exact
+    cands = sorted(
+        p for p in data_dir.glob(f"{stem}_*.npz")
+        if not (exclude and exclude in p.name)
+    )
+    if not cands:
+        raise FileNotFoundError(f"no {stem}.npz or {stem}_*.npz in {data_dir}")
+    return cands[-1]
+
+
 class Dataset:
     """In-memory view of the two .npz files."""
 
     def __init__(self, data_dir: Path = DATA_DIR):
-        poly = np.load(data_dir / "polytope.npz", allow_pickle=True)
-        samp = np.load(data_dir / "polytope_samples.npz", allow_pickle=True)
+        poly_path = _resolve(data_dir, "polytope", exclude="samples")
+        samp_path = _resolve(data_dir, "polytope_samples")
+        print(f"[data] loading {poly_path.name} + {samp_path.name}", flush=True)
+        poly = np.load(poly_path, allow_pickle=True)
+        samp = np.load(samp_path, allow_pickle=True)
 
         self.A = poly["A"]                       # (172, 10)
         self.b = poly["b"]                       # (172,)
@@ -42,9 +65,25 @@ class Dataset:
 
         cfg = samp["config"].item()
         self.config = cfg
-        self.u_star = samp["u_star"]             # (9,) optimum, technologies only
         self.c_star = float(cfg.get("c_star"))
         self.epsilon = float(cfg.get("epsilon"))
+
+        # The cost optimum, technologies only (9,). NOTE: `u_star` in these files
+        # is NOT the optimum — it is the per-axis normalization maxima (hence it
+        # maps to the unit corner). The real optimum is `z_star` (added in the
+        # v08 files). Fall back to u_star only for older files that lack z_star.
+        self.norm_max = np.asarray(samp["u_star"], dtype=float)  # per-axis maxima
+        if "z_star" in poly.files:
+            self.optimum_tech = np.asarray(poly["z_star"], dtype=float)
+        elif "z_star_physical" in cfg:
+            self.optimum_tech = np.asarray(cfg["z_star_physical"], dtype=float)[: len(self.tech_idx)]
+        else:
+            print("[data] WARNING: no z_star found; falling back to u_star "
+                  "(normalization maxima) as the optimum — overlay will be wrong",
+                  flush=True)
+            self.optimum_tech = self.norm_max
+        # back-compat alias: callers/serializers still read `u_star` as the optimum
+        self.u_star = self.optimum_tech
 
         # The norm<->phys map is a per-axis linear rescaling (verified diagonal
         # & exactly affine). Recover scale/offset so phys = norm*scale + offset.
@@ -58,7 +97,7 @@ class Dataset:
 
         # Optimum as a full 10-vector in physical units, then in norm space.
         opt_phys = np.empty(len(self.axes))
-        opt_phys[self.tech_idx] = self.u_star
+        opt_phys[self.tech_idx] = self.optimum_tech
         opt_phys[self.cost_idx] = self.c_star
         self.optimum_norm = (opt_phys - self._offset) / self._scale  # (10,)
 

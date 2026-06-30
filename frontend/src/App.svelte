@@ -228,13 +228,17 @@
   let morphPlaying = $state(false);
   let morphTimer: ReturnType<typeof setInterval> | null = null;
   let hoverPin = $state<number | null>(null); // index into pins
+  let simPin = $state<number | null>(null); // pin id whose "find similar" highlight is active
 
   function addPin(label: string, values: number[], point: [number, number], normVals?: number[]) {
     if (pins.length >= 6) return;
     if (pins.some((p) => p.label === label)) return;
+    // Pick the first palette color not already in use, so removing a pin and
+    // adding another doesn't collide with a surviving pin's color.
+    const used = new Set(pins.map((p) => p.color));
+    const color = PIN_COLORS.find((c) => !used.has(c)) ?? PIN_COLORS[pins.length % PIN_COLORS.length];
     pins = [...pins, {
-      id: pinSeq++, label, values, point, normTech: normVals,
-      color: PIN_COLORS[pins.length % PIN_COLORS.length],
+      id: pinSeq++, label, values, point, normTech: normVals, color,
     }];
     morphT = 0;
   }
@@ -251,7 +255,7 @@
     if (!dispOptimum || !meta) return;
     const v = [...meta.optimum.u_star, meta.optimum.c_star];
     const ci = meta.axes.indexOf(meta.cost_axis);
-    addPin("u* optimum", v, dispOptimum as [number, number],
+    addPin("optimum", v, dispOptimum as [number, number],
       meta.optimum.norm.filter((_, k) => k !== ci));
   }
   // pins re-projected live in star mode (anchors move under them)
@@ -291,6 +295,7 @@
 
   // highlight ~250 designs most similar to a pin (normalized distance over technologies)
   function findSimilar(p: Pin) {
+    if (simPin === p.id) { clearSelection(); return; } // clicking again clears it
     if (!dispValues.length || !techRanges.length) return;
     const tech = dispFields.map((_, j) => j).filter((j) => dispFields[j] !== "net_present_cost");
     const span = tech.map((j) => {
@@ -307,6 +312,7 @@
     });
     d.sort((a, b) => a[0] - b[0]);
     selected = d.slice(0, 250).map((x) => x[1]);
+    simPin = p.id;
   }
   function techIdxOf(fieldIdx: number): number {
     // maps a dispFields index to the 0..8 technology index (cost excluded)
@@ -321,6 +327,7 @@
 
   function clearSelection() {
     selected = null;
+    simPin = null;
     pcoords?.clearBrushes();
   }
 
@@ -609,6 +616,19 @@
   const pcOverlayColor = $derived(
     hoverPin !== null && pins[hoverPin] ? pins[hoverPin].color : "#ffffff",
   );
+  // The two interpolation endpoints, drawn statically in their pin colors on the
+  // parallel coordinates while the white overlay sweeps between them.
+  const pcStatic = $derived(
+    pins.length >= 2
+      ? [
+          { values: pins[0].values, color: pins[0].color },
+          { values: pins[1].values, color: pins[1].color },
+        ]
+      : [],
+  );
+  // Pinned designs (e.g. extremes) can lie outside the sampled range; pass their
+  // values so the parallel-coords axes widen to keep their lines inside the plot.
+  const pcDomainExtra = $derived(pins.map((p) => p.values));
 
   // ---- hover tooltip ----
   // hoverIdx is the position within the rendered arrays; dispValues / dispPoints
@@ -703,7 +723,7 @@
         {selected}
         {mode}
         onhover={(i) => (hoverIdx = i)}
-        onselect={(idx) => (selected = idx.length ? idx : null)}
+        onselect={(idx) => { selected = idx.length ? idx : null; simPin = null; }}
         onpin={pinRow}
         onspoke={pinExtreme}
         draggableMarkers={isStar && !inCandidates}
@@ -893,7 +913,7 @@
     <section class="hud panel tray">
       <div class="tray-head">
         <span>Pinned designs</span>
-        <button class="link" onclick={pinOptimum} title="pin the cost optimum">+ u*</button>
+        <button class="link" onclick={pinOptimum} title="pin the cost optimum">+ optimum</button>
       </div>
 
       {#if !pins.length}
@@ -923,7 +943,9 @@
               size={92}
             />
             <div class="card-actions">
-              <button class="mini" onclick={() => findSimilar(p)}>similar</button>
+              <button class="mini" class:active={simPin === p.id} onclick={() => findSimilar(p)}>
+                {simPin === p.id ? "clear similar" : "similar"}
+              </button>
             </div>
           </div>
         </div>
@@ -963,8 +985,10 @@
           colorMax={dispColorMax}
           overlay={pcOverlay}
           overlayColor={pcOverlayColor}
+          staticLines={pcStatic}
+          domainExtra={pcDomainExtra}
           {selected}
-          onbrush={(rows, cons) => { selected = rows; brushConstraints = cons; }}
+          onbrush={(rows, cons) => { selected = rows; brushConstraints = cons; simPin = null; }}
         />
       </div>
     </section>
@@ -1100,6 +1124,7 @@
   .mini {
     font-size: 11px; padding: 3px 8px; border-radius: 6px;
   }
+  .mini.active { background: var(--accent); color: #0b0f14; border-color: var(--accent); }
   .morph { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #2a3441; padding-top: 8px; }
   .morph-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
   .morph input[type="range"] { width: 100%; accent-color: var(--accent); }

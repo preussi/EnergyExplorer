@@ -29,7 +29,8 @@ backend (FastAPI)  numpy + scikit-learn + scipy
 - `backend/app/` — `main.py` (routes), `data.py` (`Dataset`, npz loading,
   norm↔phys), `projections.py` (PCA/t-SNE/UMAP + cache builder), `generate.py`
   (steering/candidate generation).
-- `backend/data/` — `polytope.npz`, `polytope_samples.npz` (read-only, baked in).
+- `backend/data/` — `polytope_NN.npz`, `polytope_samples_NN.npz` (versioned;
+  currently v08). The loader (`data.py:_resolve`) auto-picks the newest suffix.
 - `backend/cache/` — precomputed t-SNE/UMAP `.npy`, mounted as a volume.
 - `backend/scripts/npz_to_csv.py` — npz → `data/csv/` export helper.
 - `frontend/src/lib/` — `ScatterGL`, `ParallelCoords`, `FacetView`,
@@ -40,12 +41,14 @@ backend (FastAPI)  numpy + scikit-learn + scipy
 Axes: `nuclear, photovoltaics, wind_offshore, wind_onshore, electrolysis, DAC,
 battery, ccs_lump, biomass, net_present_cost`.
 
-- `polytope.npz` — `A`(172,10), `b`(172,), `X`(153,10): polytope `{x : A·x ≤ b}`.
-- `polytope_samples.npz` — 20k uniform samples from **two samplers** (`chrrt`,
+- `polytope_NN.npz` — `A`, `b`, `X`: polytope `{x : A·x ≤ b}` (v08: 429 rows).
+  **`z_star`** = the real cost optimum (9-D physical techs). **`u_star`** = per-axis
+  normalization maxima, **NOT** the optimum (see below).
+- `polytope_samples_NN.npz` — 20k uniform samples from **two samplers** (`chrrt`,
   `har`), each in **normalized** (`*_norm`, ~[0,1], use for projections/distance)
   and **physical** (`*_phys`, GW/MtCO₂/NPC, use for tooltips/axis labels) units;
-  `round_transformation`/`round_shift` map between them; `u_star`/`c_star` =
-  cost-optimal reference.
+  `round_transformation`/`round_shift` map between them; `config["c_star"]` =
+  optimal cost, `config["z_star_physical"]` = optimum.
 
 ## API (backend/app/main.py)
 
@@ -89,12 +92,13 @@ Deploys to ETH IVIA via `helm/` (see commit history / CI).
   sequence token or response-identity check, or out-of-order responses clobber
   newer state.
 
-## Known data issue
+## Optimum: `z_star`, not `u_star` (data issue RESOLVED)
 
-`docs/OPTIMUM_DATA_ISSUE.md`: the provided optimum `u_star`/`c_star` normalizes to
-the unit corner `[1,1,1,1,1,1,1,1,1,0]` and sits **outside** the sampled polytope
-(exceeds the sample max on all 9 techs, below sample min on cost). Likely an
-upstream normalization/provenance artifact, not an app bug — the app draws the
-point it's given. Open question for the data producer: is `u_star` in the same
-normalization/polytope frame as the samples? The optimum overlay (flat line pinned
-across the top of parallel coords, dropping for cost) is the visible symptom.
+`docs/OPTIMUM_DATA_ISSUE.md`: the old "optimum outside the polytope" was a misread.
+**`u_star` is the per-axis normalization maxima** (→ unit corner `[1,…,1,0]`), not
+the optimum. The **real optimum is `z_star`** (v08+), verified *inside* the polytope
+(`A·z_star ≤ b`, 0 violations). `data.py` loads the optimum from `z_star`;
+`self.u_star` is a back-compat alias holding the optimum so `/api/meta` and the
+"u* optimum" pin stay correct. Caveats: the upstream data is **provisional** (the
+producer is fixing an algorithm-accuracy flaw), and t-SNE/UMAP caches built on old
+data are **stale** — rebuild with `python -m app.projections --force`.

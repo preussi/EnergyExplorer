@@ -13,6 +13,8 @@
     colorMax = 1,
     overlay = null,
     overlayColor = "#ffffff",
+    staticLines = [],
+    domainExtra = [],
     onbrush,
   }: {
     fields: string[];
@@ -24,6 +26,12 @@
     colorMax?: number;
     overlay?: number[] | null; // one design's values (all fields) drawn as a bright line
     overlayColor?: string;
+    // designs drawn statically in their own colors (e.g. the A/B interpolation
+    // anchors), under the moving `overlay` line.
+    staticLines?: { values: number[]; color: string }[];
+    // extra design rows the axes must contain (e.g. pinned extreme designs that
+    // lie outside the sampled range) so their lines stay within the plot.
+    domainExtra?: number[][];
     onbrush?: (
       rows: number[] | null,
       constraints: { axis: string; min: number; max: number }[],
@@ -65,6 +73,13 @@
       let lo = Infinity, hi = -Infinity;
       for (let r = 0; r < values.length; r++) {
         const v = values[r][a];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      // widen the axis to contain any out-of-sample designs (e.g. pinned extremes)
+      for (const row of domainExtra) {
+        const v = row?.[a];
+        if (v == null) continue;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
       }
@@ -204,8 +219,8 @@
   // Layout + base layer. Writes scales/xPos (for the SVG) but never reads them,
   // so it cannot re-trigger itself. Re-runs on data or size change.
   $effect(() => {
-    const f = fields, v = values, w = W, h = H;
-    if (!base || !w || !h || !f.length || !v.length) return;
+    const f = fields, v = values, w = W, h = H, de = domainExtra;
+    if (!base || !w || !h || !f.length || !v.length || !de) return;
     const { sc, xp } = buildLayout(w, h);
     scales = sc;
     xPos = xp;
@@ -224,7 +239,7 @@
   // Reads scales/xPos/selected/rowColor/overlay; writes nothing.
   $effect(() => {
     const sel = selected, w = W, h = H, sc = scales, xp = xPos, rc = rowColor;
-    const ov = overlay, oc = overlayColor;
+    const ov = overlay, oc = overlayColor, stat = staticLines;
     if (!hl || !w || !h || !sc.length) return;
     const ctx = setupCanvas(hl, w, h);
     ctx.clearRect(0, 0, w, h);
@@ -233,22 +248,29 @@
     ctx.lineWidth = hasSel ? 0.9 : 0.5;
     strokeColored(ctx, rows, hasSel ? 0.5 : 0.22, sc, xp, rc);
 
-    if (ov && ov.length === fields.length) {
-      ctx.lineWidth = 2.4;
-      ctx.strokeStyle = oc;
-      ctx.shadowColor = oc;
-      ctx.shadowBlur = 7;
-      ctx.globalAlpha = 0.95;
+    const drawLine = (vals: number[], color: string, width: number, glow: number, alpha: number) => {
+      if (!vals || vals.length !== fields.length) return;
+      ctx.lineWidth = width;
+      ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = glow;
+      ctx.globalAlpha = alpha;
       ctx.beginPath();
       for (let a = 0; a < xp.length; a++) {
-        const x = xp[a], y = sc[a](ov[a]);
+        const x = xp[a], y = sc[a](vals[a]);
         if (a === 0) ctx.moveTo(x, y);
         else ctx.lineTo(x, y);
       }
       ctx.stroke();
       ctx.shadowBlur = 0;
       ctx.globalAlpha = 1;
-    }
+    };
+
+    // static anchor designs (e.g. the A/B interpolation endpoints) in their colors
+    for (const s of stat) drawLine(s.values, s.color, 2.0, 4, 0.9);
+
+    // moving overlay design (e.g. the A→B interpolation) on top
+    if (ov) drawLine(ov, oc, 2.4, 7, 0.95);
   });
 </script>
 

@@ -490,7 +490,7 @@
       onpointerdown={(e) => startMarkerDrag(e, "optimum", -1)}
       onpointermove={moveMarkerDrag}
       onpointerup={endMarkerDrag}
-      title={draggableMarkers ? "drag to rotate the projection" : "Cost optimum (u*)"}
+      title={draggableMarkers ? "drag to rotate the projection" : "Cost optimum"}
     ></div>
   {/if}
 </div>
