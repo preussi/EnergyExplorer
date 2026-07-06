@@ -15,6 +15,8 @@
     overlayColor = "#ffffff",
     staticLines = [],
     domainExtra = [],
+    showViolins = false,
+    flexRanges = [],
     onbrush,
   }: {
     fields: string[];
@@ -32,6 +34,12 @@
     // extra design rows the axes must contain (e.g. pinned extreme designs that
     // lie outside the sampled range) so their lines stay within the plot.
     domainExtra?: number[][];
+    // when true, draw a marginal-density violin per axis instead of the 20k faint
+    // polylines; individual lines are then drawn only for the active subset.
+    showViolins?: boolean;
+    // exact LP feasible [min,max] per axis under current constraints, drawn as a
+    // band on each axis (physical units, matched to fields by `axis` name).
+    flexRanges?: { axis: string; min: number | null; max: number | null }[];
     onbrush?: (
       rows: number[] | null,
       constraints: { axis: string; min: number; max: number }[],
@@ -82,6 +90,13 @@
         if (v == null) continue;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
+      }
+      // and to contain the exact LP feasible range (its bounds sit at the polytope
+      // boundary, past where the samples reach), so the flex band fits on-axis
+      const rg = flexRanges.find((r) => r.axis === fields[a]);
+      if (rg) {
+        if (rg.min != null && rg.min < lo) lo = rg.min;
+        if (rg.max != null && rg.max > hi) hi = rg.max;
       }
       if (lo === hi) hi = lo + 1;
       return scaleLinear().domain([lo, hi]).range([h - M.bottom, M.top]);
@@ -216,20 +231,104 @@
     brushes = fields.map(() => null);
   });
 
+  // Per-axis marginal-density violin over a set of rows (all designs, or a brushed
+  // subset for the conditional distribution). Each axis is self-normalized so the
+  // shape is visible; `rows === null` means the full population.
+  const VBINS = 44;
+  function violinHalfMax(xp: number[]): number {
+    const spacing = fields.length > 1 ? Math.abs(xp[1] - xp[0]) : W - M.left - M.right;
+    return Math.min(26, spacing * 0.4);
+  }
+  function drawViolins(
+    ctx: CanvasRenderingContext2D,
+    sc: ScaleLinear<number, number>[], xp: number[],
+    rows: number[] | null, fill: string, stroke: string,
+  ) {
+    const halfMax = violinHalfMax(xp);
+    const N = rows ? rows.length : values.length;
+    if (!N) return;
+    for (let a = 0; a < fields.length; a++) {
+      const scale = sc[a];
+      const [dlo, dhi] = scale.domain();
+      const span = dhi - dlo || 1;
+      const counts = new Array(VBINS).fill(0);
+      const add = (v: number) => {
+        let bin = Math.floor(((v - dlo) / span) * VBINS);
+        if (bin < 0) bin = 0; else if (bin >= VBINS) bin = VBINS - 1;
+        counts[bin]++;
+      };
+      if (rows) for (const r of rows) add(values[r][a]);
+      else for (let r = 0; r < values.length; r++) add(values[r][a]);
+      // 3-tap smoothing for a violin (rather than blocky histogram) look
+      const sm = counts.map((c, i) =>
+        ((counts[i - 1] ?? c) + 2 * c + (counts[i + 1] ?? c)) / 4);
+      const maxC = Math.max(...sm) || 1;
+      const x = xp[a];
+      const yOf = (i: number) => scale(dlo + ((i + 0.5) / VBINS) * span);
+      ctx.beginPath();
+      for (let i = 0; i < VBINS; i++) {
+        const hw = (sm[i] / maxC) * halfMax;
+        if (i === 0) ctx.moveTo(x + hw, yOf(i));
+        else ctx.lineTo(x + hw, yOf(i));
+      }
+      for (let i = VBINS - 1; i >= 0; i--) ctx.lineTo(x - (sm[i] / maxC) * halfMax, yOf(i));
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // Exact LP feasible [min,max] per axis, drawn as a band behind the violin. The
+  // band typically extends past the sample density (samples thin out at the
+  // polytope boundary), which is exactly the point — provable range vs density.
+  function drawFlexBands(
+    ctx: CanvasRenderingContext2D,
+    sc: ScaleLinear<number, number>[], xp: number[],
+  ) {
+    if (!flexRanges.length) return;
+    const half = violinHalfMax(xp) + 5;
+    for (let a = 0; a < fields.length; a++) {
+      const rg = flexRanges.find((r) => r.axis === fields[a]);
+      if (!rg || rg.min == null || rg.max == null) continue;
+      const yHi = sc[a](rg.max), yLo = sc[a](rg.min);
+      const x = xp[a];
+      ctx.fillStyle = "rgba(244,180,60,0.10)";
+      ctx.fillRect(x - half, yHi, half * 2, yLo - yHi);
+      ctx.strokeStyle = "rgba(244,180,60,0.7)";
+      ctx.lineWidth = 1.2;
+      for (const y of [yHi, yLo]) {
+        ctx.beginPath();
+        ctx.moveTo(x - half, y);
+        ctx.lineTo(x + half, y);
+        ctx.stroke();
+      }
+    }
+  }
+
   // Layout + base layer. Writes scales/xPos (for the SVG) but never reads them,
   // so it cannot re-trigger itself. Re-runs on data or size change.
   $effect(() => {
-    const f = fields, v = values, w = W, h = H, de = domainExtra;
+    const f = fields, v = values, w = W, h = H, de = domainExtra, vi = showViolins, fr = flexRanges;
     if (!base || !w || !h || !f.length || !v.length || !de) return;
     const { sc, xp } = buildLayout(w, h);
     scales = sc;
     xPos = xp;
     const ctx = setupCanvas(base, w, h);
     ctx.clearRect(0, 0, w, h);
-    // faint neutral context for ALL designs (so a selection reads as "the rest")
-    ctx.lineWidth = 0.6;
-    ctx.strokeStyle = "rgba(139,148,158,0.06)";
-    strokeRows(ctx, v.keys(), sc, xp);
+    if (vi) {
+      // exact-range bands behind, then the full-population violin (neutral ghost);
+      // the brushed conditional violin is drawn brighter on the highlight layer.
+      if (fr.length) drawFlexBands(ctx, sc, xp);
+      drawViolins(ctx, sc, xp, null, "rgba(139,148,158,0.13)", "rgba(139,148,158,0.4)");
+    } else {
+      // faint neutral context for ALL designs (so a selection reads as "the rest")
+      ctx.lineWidth = 0.6;
+      ctx.strokeStyle = "rgba(139,148,158,0.06)";
+      strokeRows(ctx, v.keys(), sc, xp);
+    }
   });
 
   // Highlight layer, colored by the current field. When a selection is active we
@@ -239,14 +338,21 @@
   // Reads scales/xPos/selected/rowColor/overlay; writes nothing.
   $effect(() => {
     const sel = selected, w = W, h = H, sc = scales, xp = xPos, rc = rowColor;
-    const ov = overlay, oc = overlayColor, stat = staticLines;
+    const ov = overlay, oc = overlayColor, stat = staticLines, vi = showViolins;
     if (!hl || !w || !h || !sc.length) return;
     const ctx = setupCanvas(hl, w, h);
     ctx.clearRect(0, 0, w, h);
     const hasSel = !!(sel && sel.length);
-    const rows: Iterable<number> = hasSel ? sel! : values.keys();
-    ctx.lineWidth = hasSel ? 0.9 : 0.5;
-    strokeColored(ctx, rows, hasSel ? 0.5 : 0.22, sc, xp, rc);
+    if (vi) {
+      // conditional distribution: the brushed subset as a bright violin on top of
+      // the ghost full-population one (answers "if I fix this, what happens?").
+      if (hasSel) drawViolins(ctx, sc, xp, sel!, "rgba(45,212,191,0.30)", "rgba(45,212,191,0.9)");
+    } else {
+      // non-violin mode: color the selection, or the whole set as a vivid overview.
+      const rows: Iterable<number> = hasSel ? sel! : values.keys();
+      ctx.lineWidth = hasSel ? 0.9 : 0.5;
+      strokeColored(ctx, rows, hasSel ? 0.5 : 0.22, sc, xp, rc);
+    }
 
     const drawLine = (vals: number[], color: string, width: number, glow: number, alpha: number) => {
       if (!vals || vals.length !== fields.length) return;

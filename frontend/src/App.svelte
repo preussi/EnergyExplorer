@@ -52,7 +52,7 @@
   let mode = $state<"pan" | "select">("pan");
 
   // ---- view mode: projection map vs exact facet (shadow) views ----
-  let viewMode = $state<"map" | "facets" | "coupling">("map");
+  let viewMode = $state<"profiles" | "map" | "facets" | "coupling">("coupling");
   // pairwise dependence (dCor / MI / Pearson) for the Coupling tab + facet ranking
   let depData = $state<Dependence | null>(null);
   let depMetric = $state<DependenceMetric>("dcor");
@@ -407,7 +407,6 @@
     pcoords?.clearBrushes();
   }
 
-  const PALETTE = ["#e64a3b", "#2e8cdc", "#2ebd78", "#f2c52e", "#9c59b6", "#e67d21"];
   const SHORT: Record<string, string> = {
     photovoltaics: "PV", wind_offshore: "wind-off", wind_onshore: "wind-on",
     electrolysis: "electro", net_present_cost: "cost",
@@ -603,6 +602,15 @@
   const techValues = (p: Pin) =>
     p.values.filter((_, j) => dispFields[j] !== "net_present_cost");
 
+  // Interpolated A→B design (full 10-vector) and its 9 technology values, for the
+  // morph radar glyph. Mirrors the white parallel-coords overlay.
+  const morphValues = $derived(
+    pins.length >= 2 ? lerp(pins[0].values, pins[1].values, morphT) : null,
+  );
+  const morphTechValues = $derived(
+    morphValues ? morphValues.filter((_, j) => dispFields[j] !== "net_present_cost") : [],
+  );
+
   // morph state shown on map & parallel coords (uses live-projected pin points)
   const morphPath = $derived(
     pins.length >= 2 ? { a: pinPoints[0], b: pinPoints[1], t: morphT } : null,
@@ -630,6 +638,61 @@
   // values so the parallel-coords axes widen to keep their lines inside the plot.
   const pcDomainExtra = $derived(pins.map((p) => p.values));
 
+  // ---- coupling-ordered axes (§3) ----
+  // Order the parallel-coords axes so strongly-coupled ones (high distance
+  // correlation) sit next to each other, making trade-offs read between neighbors.
+  let couplingAxes = $state(true);
+  // Greedy seriation: start from the most-coupled pair, then repeatedly attach the
+  // unused axis most coupled to either end of the growing chain.
+  function couplingSeriation(D: number[][]): number[] {
+    const n = D.length;
+    if (n < 2) return Array.from({ length: n }, (_, i) => i);
+    let bi = 0, bj = 1, best = -Infinity;
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++)
+        if (D[i][j] > best) { best = D[i][j]; bi = i; bj = j; }
+    const order = [bi, bj];
+    const used = new Set(order);
+    while (order.length < n) {
+      const head = order[0], tail = order[order.length - 1];
+      let node = -1, sim = -Infinity, atHead = false;
+      for (let k = 0; k < n; k++) {
+        if (used.has(k)) continue;
+        if (D[tail][k] > sim) { sim = D[tail][k]; node = k; atHead = false; }
+        if (D[head][k] > sim) { sim = D[head][k]; node = k; atHead = true; }
+      }
+      if (node < 0) break;
+      used.add(node);
+      if (atHead) order.unshift(node); else order.push(node);
+    }
+    return order;
+  }
+  // Permutation of dispFields column indices; [] means canonical order.
+  const axisOrder = $derived.by(() => {
+    if (!couplingAxes || !depData?.dcor?.length || !dispFields.length) return [];
+    const idx = dispFields.map((f) => depData!.axes.indexOf(f));
+    if (idx.some((i) => i < 0)) return [];
+    const n = dispFields.length;
+    const D = Array.from({ length: n }, (_, i) =>
+      Array.from({ length: n }, (_, j) => depData!.dcor[idx[i]][idx[j]] ?? 0));
+    return couplingSeriation(D);
+  });
+  function reorder<T>(arr: T[], ord: number[]): T[] { return ord.map((i) => arr[i]); }
+  // Reordered copies of ONLY the parallel-coords props (keeps dispFields/dispValues
+  // and every other consumer in canonical order). flexRanges match by axis name, so
+  // they need no reordering.
+  const pcFields = $derived(axisOrder.length ? reorder(dispFields, axisOrder) : dispFields);
+  const pcValues = $derived.by(() =>
+    axisOrder.length ? dispValues.map((row) => reorder(row, axisOrder)) : dispValues);
+  const pcOverlayOrd = $derived(
+    axisOrder.length && pcOverlay ? reorder(pcOverlay, axisOrder) : pcOverlay);
+  const pcStaticOrd = $derived(
+    axisOrder.length
+      ? pcStatic.map((s) => ({ values: reorder(s.values, axisOrder), color: s.color }))
+      : pcStatic);
+  const pcDomainExtraOrd = $derived(
+    axisOrder.length ? pcDomainExtra.map((row) => reorder(row, axisOrder)) : pcDomainExtra);
+
   // ---- hover tooltip ----
   // hoverIdx is the position within the rendered arrays; dispValues / dispPoints
   // are aligned to it, so the tooltip indexes by hoverRow directly. The original
@@ -642,11 +705,46 @@
   const fmt = (v: number) =>
     Math.abs(v) >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
     : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(3);
-  const deltaCost = (p: Pin) => {
-    if (!meta || costIdx < 0) return "";
-    const d = ((p.values[costIdx] - meta.optimum.c_star) / meta.optimum.c_star) * 100;
+  const deltaCost = (values: number[]) => {
+    if (!meta || costIdx < 0 || !values) return "";
+    const d = ((values[costIdx] - meta.optimum.c_star) / meta.optimum.c_star) * 100;
     return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`;
   };
+
+  // ---- constraint → consequence readout (§4) ----
+  // Synthesizes the exact-LP flexibility (flexBase vs flexCur) into decision terms:
+  // the cost penalty of the current constraints, and which levers they force up or
+  // cap / which options they foreclose.
+  type Consequence = { axis: string; kind: "force" | "include" | "limit"; text: string; mag: number };
+  const consequences = $derived.by(() => {
+    if (!allConstraints.length || !meta || !flexBase.length) return null;
+    if (!flexFeasible) return { infeasible: true, costPct: null, items: [] as Consequence[] };
+    const costAxis = meta.cost_axis;
+    const baseBy = new Map(flexBase.map((r) => [r.axis, r]));
+    const curCost = flexCur.find((r) => r.axis === costAxis);
+    const costPct = curCost?.min != null
+      ? ((curCost.min - meta.optimum.c_star) / meta.optimum.c_star) * 100 : null;
+    const items: Consequence[] = [];
+    for (const cur of flexCur) {
+      if (cur.axis === costAxis || cur.min == null || cur.max == null) continue;
+      const base = baseBy.get(cur.axis);
+      if (!base || base.min == null || base.max == null) continue;
+      const span = base.max - base.min || 1;
+      const rose = cur.min - base.min;   // feasible floor lifted → forced up
+      const fell = base.max - cur.max;   // feasible ceiling dropped → capped
+      if (rose > 0.03 * span) {
+        const excludable = base.min <= 0.001 * span; // could be ~0 before
+        items.push(excludable
+          ? { axis: cur.axis, kind: "include", mag: rose / span, text: `must build ${short(cur.axis)} ≥ ${fmt(cur.min)}` }
+          : { axis: cur.axis, kind: "force", mag: rose / span, text: `${short(cur.axis)} forced ≥ ${fmt(cur.min)}` });
+      }
+      if (fell > 0.03 * span) {
+        items.push({ axis: cur.axis, kind: "limit", mag: fell / span, text: `${short(cur.axis)} capped ≤ ${fmt(cur.max)}` });
+      }
+    }
+    items.sort((a, b) => b.mag - a.mag);
+    return { infeasible: false, costPct, items: items.slice(0, 6) };
+  });
 </script>
 
 <div class="stage" role="presentation" onmousemove={onMove}>
@@ -654,11 +752,14 @@
   <header class="hud panel topbar">
     <h1>Energy Explorer <small>near-optimal energy-system designs</small></h1>
     <div class="seg view-seg">
-      <button class:active={viewMode === "map"} onclick={() => (viewMode = "map")}>Map</button>
-      <button class:active={viewMode === "facets"} onclick={() => (viewMode = "facets")}>Facets</button>
       <button class:active={viewMode === "coupling"} onclick={() => (viewMode = "coupling")}>Coupling</button>
+      <button class:active={viewMode === "profiles"} onclick={() => (viewMode = "profiles")}>Profiles</button>
+      <button class:active={viewMode === "facets"} onclick={() => (viewMode = "facets")}>Facets</button>
+      <button class:active={viewMode === "map"} onclick={() => (viewMode = "map")}>Map</button>
     </div>
-    {#if proj && viewMode === "map"}
+    {#if viewMode === "profiles"}
+      <span class="topbar-hint">marginal distribution of each lever (violins) · brush an axis to filter · pinned designs & the A→B path overlay as lines</span>
+    {:else if proj && viewMode === "map"}
       <span class="topbar-hint">
         {mode === "select" ? "drag to lasso-select" : "scroll to zoom · drag to pan · click a point to pin"}
         {#if isStar} · drag ◯ / pins to rotate the projection{/if}
@@ -700,7 +801,7 @@
         />
       {/if}
     </div>
-  {:else if proj && colorData}
+  {:else if viewMode === "map" && proj && colorData}
     <div class="graph-region">
       <ScatterGL
         bind:this={scatter}
@@ -734,7 +835,7 @@
     </div>
   {/if}
 
-  {#if inCandidates && candidates && viewMode === "map"}
+  {#if inCandidates && candidates && (viewMode === "map" || viewMode === "profiles")}
     <div class="hud gen-banner panel">
       <span><span class="dot"></span><strong>{candidates.n.toLocaleString()}</strong> generated candidates</span>
       <button class="link" onclick={backToFull}>← back to full space</button>
@@ -761,12 +862,14 @@
 
   <!-- floating control panel (left) -->
   <aside class="hud panel">
-    <label>Method
-      <select bind:value={method} onchange={onMethodChange}>
-        {#each meta?.methods ?? ["pca"] as m}<option value={m}>{m.toUpperCase()}</option>{/each}
-        <option value="star">STAR ✦ (drag anchors)</option>
-      </select>
-    </label>
+    {#if viewMode === "map"}
+      <label>Method
+        <select bind:value={method} onchange={onMethodChange}>
+          {#each meta?.methods ?? ["pca"] as m}<option value={m}>{m.toUpperCase()}</option>{/each}
+          <option value="star">STAR ✦ (drag anchors)</option>
+        </select>
+      </label>
+    {/if}
 
     {#if isStar && viewMode === "map"}
       <div class="star-box">
@@ -788,37 +891,38 @@
     <label>Color by
       <select bind:value={field} onchange={loadColor}>
         {#each meta?.axes ?? [] as a}<option value={a}>{a}</option>{/each}
-        <option value="chain">chain (sampler diagnostic)</option>
       </select>
     </label>
-    <label class="check">
-      <input type="checkbox" bind:checked={showOptimum} /> cost optimum ◯
-    </label>
-    <label class="check">
-      <input type="checkbox" bind:checked={showClusters} /> region labels
-    </label>
+    {#if viewMode === "map"}
+      <label class="check">
+        <input type="checkbox" bind:checked={showOptimum} /> cost optimum ◯
+      </label>
+      <label class="check">
+        <input type="checkbox" bind:checked={showClusters} /> region labels
+      </label>
 
-    <div class="sect">Overlays</div>
-    <label class="check">
-      <input type="checkbox" bind:checked={showDensity} /> option topography
-    </label>
-    <label class="check" class:dis={method !== "pca"}>
-      <input type="checkbox" bind:checked={showCompass} disabled={method !== "pca"} /> tech compass
-    </label>
-    <label class="check" class:dis={method !== "pca" || inCandidates}>
-      <input type="checkbox" bind:checked={showSpokes} disabled={method !== "pca" || inCandidates} /> extreme designs
-    </label>
-    <label class="check" class:dis={inCandidates}>
-      <input type="checkbox" bind:checked={walkOn} disabled={inCandidates} /> sampler walk
-    </label>
+      <div class="sect">Overlays</div>
+      <label class="check">
+        <input type="checkbox" bind:checked={showDensity} /> option topography
+      </label>
+      <label class="check" class:dis={method !== "pca"}>
+        <input type="checkbox" bind:checked={showCompass} disabled={method !== "pca"} /> tech compass
+      </label>
+      <label class="check" class:dis={method !== "pca" || inCandidates}>
+        <input type="checkbox" bind:checked={showSpokes} disabled={method !== "pca" || inCandidates} /> extreme designs
+      </label>
+      <label class="check" class:dis={inCandidates}>
+        <input type="checkbox" bind:checked={walkOn} disabled={inCandidates} /> sampler walk
+      </label>
 
-    <div class="mode">
-      <span class="mode-label">Drag mode</span>
-      <div class="seg">
-        <button class:active={mode === "pan"} onclick={() => (mode = "pan")}>Pan</button>
-        <button class:active={mode === "select"} onclick={() => (mode = "select")}>Select</button>
+      <div class="mode">
+        <span class="mode-label">Drag mode</span>
+        <div class="seg">
+          <button class:active={mode === "pan"} onclick={() => (mode = "pan")}>Pan</button>
+          <button class:active={mode === "select"} onclick={() => (mode = "select")}>Select</button>
+        </div>
       </div>
-    </div>
+    {/if}
 
     <div class="sel-info">
       {#if selected}
@@ -829,7 +933,31 @@
       {/if}
     </div>
 
-    <button onclick={() => scatter?.reset()}>Reset view</button>
+    {#if viewMode === "map"}
+      <button onclick={() => scatter?.reset()}>Reset view</button>
+    {/if}
+
+    {#if consequences}
+      <div class="sect">Consequences</div>
+      {#if consequences.infeasible}
+        <span class="cons-bad">✕ no feasible design under these constraints</span>
+      {:else}
+        <div class="cons-cost">
+          {#if consequences.costPct != null && consequences.costPct > 0.05}
+            cost <strong>+{consequences.costPct.toFixed(1)}%</strong> <span class="muted">vs optimum</span>
+          {:else}
+            <span class="muted">no cost penalty</span>
+          {/if}
+          {#if flexBusy}<span class="muted small"> · updating…</span>{/if}
+        </div>
+        {#each consequences.items as it}
+          <div class="cons-item {it.kind}">{it.text}</div>
+        {/each}
+        {#if !consequences.items.length}
+          <span class="muted small">no lever forced or capped yet</span>
+        {/if}
+      {/if}
+    {/if}
 
     <div class="sect">Remaining flexibility</div>
     {#if flexBase.length && meta}
@@ -891,20 +1019,14 @@
     {#if colorData}
       <div class="legend">
         <span class="legend-title">{colorData.field}</span>
-        {#if colorData.categorical}
-          {#each Array(colorData.max + 1) as _, i}
-            <div class="swatch"><span style="background:{PALETTE[i % PALETTE.length]}"></span>chain {i}</div>
-          {/each}
-        {:else}
-          <div class="ramp"></div>
-          <div class="ramp-labels"><span>{fmt(colorData.min)}</span><span>{fmt(colorData.max)}</span></div>
-        {/if}
+        <div class="ramp"></div>
+        <div class="ramp-labels"><span>{fmt(colorData.min)}</span><span>{fmt(colorData.max)}</span></div>
       </div>
     {/if}
   </aside>
 
-  <!-- compare tray (right): pinned designs, radar glyphs, A→B morph (map view only) -->
-  {#if viewMode === "map" && (pins.length || proj?.optimum)}
+  <!-- compare tray (right): pinned designs, radar glyphs, A→B morph -->
+  {#if (viewMode === "map" || viewMode === "profiles") && (pins.length || proj?.optimum)}
     <section class="hud panel tray">
       <div class="tray-head">
         <span>Pinned designs</span>
@@ -926,7 +1048,7 @@
           <div class="card-head">
             <span class="badge">{String.fromCharCode(65 + i)}</span>
             <span class="card-label">{p.label}</span>
-            <span class="card-cost" title="cost vs optimum">{deltaCost(p)}</span>
+            <span class="card-cost" title="cost vs optimum">{deltaCost(p.values)}</span>
             <button class="x" onclick={() => removePin(i)}>×</button>
           </div>
           <div class="card-body">
@@ -953,35 +1075,54 @@
             <button class="mini" onclick={toggleMorph}>{morphPlaying ? "⏸" : "▶"}</button>
           </div>
           <input type="range" min="0" max="1" step="0.01" bind:value={morphT} />
+          {#if morphTechValues.length}
+            <div class="morph-glyph">
+              <RadarGlyph
+                values={morphTechValues}
+                ranges={techRanges}
+                labels={techLabels}
+                color="#ffffff"
+                size={108}
+              />
+              <span class="morph-cap muted small">
+                interpolated · t={morphT.toFixed(2)} · {deltaCost(morphValues ?? [])} vs optimum
+              </span>
+            </div>
+          {/if}
           <span class="muted small">every point on this path is a feasible near-optimal design (convexity ✓)</span>
         </div>
       {/if}
     </section>
   {/if}
 
-  <!-- floating parallel-coordinates panel (bottom) -->
+  <!-- parallel-coordinates panel: bottom strip elsewhere, full stage in Profiles -->
   {#if dispValues.length}
-    <section class="hud panel pc-panel">
+    <section class="hud panel pc-panel" class:full={viewMode === "profiles"}>
       <div class="pc-head">
         <span>
           Parallel coordinates · {dispFields.length} axes · colored by {short(field)}
           {#if inCandidates}<span class="muted">· generated candidates</span>{/if}
         </span>
+        <label class="check small" title="order axes so strongly-coupled ones (distance correlation) are adjacent">
+          <input type="checkbox" bind:checked={couplingAxes} /> order by coupling
+        </label>
         <span class="muted">drag along an axis to filter · click an axis to clear it</span>
       </div>
       <div class="pc-body">
         <ParallelCoords
           bind:this={pcoords}
-          fields={dispFields}
-          values={dispValues}
+          fields={pcFields}
+          values={pcValues}
           colorValues={dispColorValues}
           colorCategorical={dispCategorical}
           colorMin={dispColorMin}
           colorMax={dispColorMax}
-          overlay={pcOverlay}
+          overlay={pcOverlayOrd}
           overlayColor={pcOverlayColor}
-          staticLines={pcStatic}
-          domainExtra={pcDomainExtra}
+          staticLines={pcStaticOrd}
+          domainExtra={pcDomainExtraOrd}
+          showViolins={true}
+          flexRanges={flexCur.length ? flexCur : flexBase}
           {selected}
           onbrush={(rows, cons) => { selected = rows; brushConstraints = cons; simPin = null; }}
         />
@@ -1004,10 +1145,11 @@
 
   .topbar {
     top: 16px; left: 16px; right: 16px; height: 48px; z-index: 4;
-    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 16px;
     padding: 0 18px;
   }
-  .view-seg { flex: none; }
+  /* center column keeps the view selector fixed regardless of the side text widths */
+  .view-seg { flex: none; justify-self: center; }
   .view-seg button { padding: 4px 16px; font-size: 12px; }
   .star-box {
     display: flex; justify-content: center; padding: 4px 0;
@@ -1015,7 +1157,7 @@
   }
   h1 { font-size: 18px; margin: 0; font-weight: 600; }
   h1 small { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
-  .topbar-hint { color: var(--muted); font-size: 12px; text-align: right; }
+  .topbar-hint { color: var(--muted); font-size: 12px; text-align: right; min-width: 0; line-height: 1.15; }
 
   .graph-region {
     position: absolute; z-index: 1;
@@ -1044,6 +1186,17 @@
   }
   .check { flex-direction: row; align-items: center; gap: 6px; color: var(--fg); }
   .check.dis { opacity: 0.45; }
+  /* consequences (§4) */
+  .cons-cost { font-size: 13px; color: var(--fg); }
+  .cons-cost strong { color: #f4b43c; }
+  .cons-item {
+    font-size: 12px; padding: 3px 8px; border-radius: 6px; border-left: 3px solid;
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .cons-item.force { border-color: #f4b43c; }
+  .cons-item.include { border-color: #e64a3b; }
+  .cons-item.limit { border-color: #2e8cdc; }
+  .cons-bad { color: #e64a3b; font-size: 13px; }
   .info { margin-top: 4px; font-size: 13px; }
   .info p { margin: 4px 0; }
   .muted { color: var(--muted); }
@@ -1123,11 +1276,18 @@
   .morph { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #2a3441; padding-top: 8px; }
   .morph-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
   .morph input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .morph-glyph { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .morph-cap { text-align: center; }
 
   .pc-panel {
     left: 252px; right: 16px; bottom: 16px; height: 200px;
     display: flex; flex-direction: column; gap: 6px;
     padding: 12px 16px;
+  }
+  /* Profiles view: parallel coords fill the main stage (leaving the left controls
+     and the right compare tray their gutters). */
+  .pc-panel.full {
+    top: 80px; right: 264px; bottom: 16px; height: auto;
   }
   .pc-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--fg); }
   .pc-body { flex: 1; min-height: 0; }
@@ -1151,8 +1311,6 @@
 
   .legend { margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .legend-title { color: var(--muted); }
-  .swatch { display: flex; align-items: center; gap: 6px; }
-  .swatch span { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
   .ramp { height: 12px; border-radius: 3px; background: linear-gradient(90deg, #45337a, #3a51a8, #228c8c, #5fbf61, #fce824); }
   .ramp-labels { display: flex; justify-content: space-between; color: var(--muted); }
 </style>
