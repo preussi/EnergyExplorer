@@ -1,14 +1,18 @@
 // Typed wrappers around the backend REST API.
 
+export interface DatasetInfo {
+  name: string;
+  is_default: boolean;
+}
+
 export interface Meta {
-  axes: string[];
-  samplers: string[];
+  axes: string[]; // 9 technologies (cost is not a design axis)
   methods: string[];
   spaces: string[];
   n_samples: number;
-  cost_axis: string;
-  optimum: { u_star: number[]; c_star: number; epsilon: number; norm: number[] };
-  diagnostics: Record<string, { rhat: number[]; ess: number[] }>;
+  optimum: { u_star: number[]; epsilon: number; norm: number[] }; // u_star = the optimum, techs only
+  diagnostics: { method: string; rhat: number[]; ess: number[] };
+  dataset: DatasetInfo; // which data is currently loaded (default vs uploaded)
 }
 
 export interface Projection {
@@ -91,6 +95,38 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
 
 export const getMeta = () => getJSON<Meta>("/api/meta");
 
+export interface UploadResult {
+  ok: boolean;
+  dataset: DatasetInfo;
+  axes: string[];
+  n_samples: number;
+}
+
+// Multipart upload of a polytope + samples .npz pair (replaces the active dataset).
+// Surfaces the backend's per-key validation errors (422) as a single message.
+export async function uploadDataset(polytope: File, samples: File): Promise<UploadResult> {
+  const fd = new FormData();
+  fd.append("polytope", polytope);
+  fd.append("samples", samples);
+  const res = await fetchRetry("/api/upload", { method: "POST", body: fd });
+  if (!res.ok) {
+    const b = await res.json().catch(() => ({}));
+    const d = (b as { detail?: unknown }).detail;
+    let msg: string;
+    if (d && typeof d === "object" && Array.isArray((d as { errors?: string[] }).errors)) {
+      msg = (d as { errors: string[] }).errors.join(" · ");
+    } else {
+      msg = typeof d === "string" ? d : `${res.status} ${res.statusText}`;
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+export function resetDataset(): Promise<{ ok: boolean; dataset: DatasetInfo }> {
+  return postJSON<{ ok: boolean; dataset: DatasetInfo }>("/api/reset", {});
+}
+
 export function getProjection(
   method: string,
   sampler: string,
@@ -132,9 +168,8 @@ export function getClusters(
 export interface ExtremeDesign {
   axis: string;
   kind: "min" | "max";
-  values: number[]; // physical, all 10 axes
+  values: number[]; // physical, 9 technologies
   point: number[]; // base-PCA coordinates
-  cost: number;
 }
 
 export function getExtremes(sampler: string): Promise<{ sampler: string; extremes: ExtremeDesign[] }> {
@@ -202,6 +237,19 @@ export function getShadow(
 
 export function getFlexibility(constraints: ConstraintInput[] = []): Promise<Flexibility> {
   return postJSON<Flexibility>("/api/flexibility", { constraints });
+}
+
+export interface VolumeEstimate {
+  feasible: boolean;
+  ratio: number;         // vol(constrained) / vol(full), in [0,1]
+  log10: number | null;  // log10(ratio); null when ratio == 0
+  levels: number;        // subset-simulation levels used (0 = direct estimate)
+  method: "trivial" | "direct" | "subset_simulation" | "empty";
+  cv: number;            // coefficient of variation (approx relative std of ratio)
+}
+
+export function getVolume(constraints: ConstraintInput[] = []): Promise<VolumeEstimate> {
+  return postJSON<VolumeEstimate>("/api/volume", { constraints });
 }
 
 export interface GenerateResult {

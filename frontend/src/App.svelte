@@ -1,11 +1,12 @@
 <script lang="ts">
   import {
     getMeta, getProjection, getColor, getSamples, getClusters, getExtremes, generate,
-    getFlexibility, getDependence, getShadowPairs,
+    getFlexibility, getVolume, getDependence, getShadowPairs, uploadDataset, resetDataset,
     type Meta, type Projection, type ColorData, type SamplesData, type ClustersData,
     type GenerateResult, type ConstraintInput, type ExtremeDesign, type FlexRange,
-    type Dependence, type DependenceMetric, type ShadowPair,
+    type VolumeEstimate, type Dependence, type DependenceMetric, type ShadowPair,
   } from "./lib/api";
+  import { onMount } from "svelte";
   import ScatterGL from "./lib/ScatterGL.svelte";
   import ParallelCoords from "./lib/ParallelCoords.svelte";
   import RadarGlyph from "./lib/RadarGlyph.svelte";
@@ -24,11 +25,11 @@
   // Cap how many designs are rendered. The 20k full set is visually overwhelming;
   // the backend downsamples deterministically (seeded), and color / parallel-coords
   // / normalized-tech are all gathered through proj.index so the views stay aligned.
-  const DISPLAY_N = 10000;
+  const DISPLAY_N = 50000;
 
   let method = $state("pca");
   const sampler = "chrrt"; // sampler choice removed from UI; chrrt is the default view
-  let field = $state("net_present_cost");
+  let field = $state("nuclear");
   let showOptimum = $state(true);
   let showClusters = $state(true);
 
@@ -71,7 +72,7 @@
   async function ensureNormTech() {
     if (normTech || !meta) return;
     const s = sampler; // discard the response if the sampler changed mid-flight
-    const tech = meta.axes.filter((a) => a !== meta!.cost_axis);
+    const tech = meta.axes; // all 9 axes are technologies
     try {
       const r = await getSamples(s, tech, "norm");
       if (s === sampler) normTech = r.values;
@@ -170,8 +171,7 @@
     if (touring) toggleTour(); // a manual grab pauses the auto-tour
     let t: number[] | null = null;
     if (kind === "optimum") {
-      const ci = meta.axes.indexOf(meta.cost_axis);
-      t = meta.optimum.norm.filter((_, k) => k !== ci);
+      t = meta.optimum.norm; // 9-D, technologies only
     } else {
       t = pins.find((p) => p.id === id)?.normTech ?? null;
     }
@@ -195,8 +195,7 @@
   });
   const starOptimum = $derived.by(() => {
     if (!isStar || !meta || !starAnchors.length) return null;
-    const costIdxMeta = meta.axes.indexOf(meta.cost_axis);
-    const tech = meta.optimum.norm.filter((_, k) => k !== costIdxMeta);
+    const tech = meta.optimum.norm; // 9-D, technologies only
     let x = 0, y = 0;
     for (let j = 0; j < starAnchors.length; j++) {
       x += tech[j] * starAnchors[j][0];
@@ -253,10 +252,8 @@
   }
   function pinOptimum() {
     if (!dispOptimum || !meta) return;
-    const v = [...meta.optimum.u_star, meta.optimum.c_star];
-    const ci = meta.axes.indexOf(meta.cost_axis);
-    addPin("optimum", v, dispOptimum as [number, number],
-      meta.optimum.norm.filter((_, k) => k !== ci));
+    addPin("optimum", [...meta.optimum.u_star], dispOptimum as [number, number],
+      meta.optimum.norm);
   }
   // pins re-projected live in star mode (anchors move under them)
   function starProject(t: number[]): [number, number] {
@@ -297,6 +294,7 @@
   function findSimilar(p: Pin) {
     if (simPin === p.id) { clearSelection(); return; } // clicking again clears it
     if (!dispValues.length || !techRanges.length) return;
+    exitSlice();
     const tech = dispFields.map((_, j) => j).filter((j) => dispFields[j] !== "net_present_cost");
     const span = tech.map((j) => {
       const rg = techRanges[techIdxOf(j)] ?? { min: 0, max: 1 };
@@ -328,6 +326,7 @@
   function clearSelection() {
     selected = null;
     simPin = null;
+    sliceAxis = null;
     pcoords?.clearBrushes();
   }
 
@@ -343,6 +342,12 @@
   let newMax = $state<number | null>(null);
 
   const allConstraints = $derived<ConstraintInput[]>([...manualConstraints, ...brushConstraints]);
+
+  // slice/sweep state (logic defined below, after dispValues/dispFields exist)
+  let sliceAxis = $state<string | null>(null);
+  let sliceValue = $state(0);
+  let sliceWidth = $state(0.03); // half-band as a fraction of the axis range
+  function exitSlice() { sliceAxis = null; brushConstraints = []; }
 
   // refresh the exact remaining-flexibility ranges when constraints change.
   // Debounced + sequence-guarded: clearTimeout can't cancel an in-flight fetch,
@@ -490,16 +495,69 @@
     };
   });
 
-  $effect(() => {
-    getMeta().then((m) => {
-      meta = m; loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
-      getFlexibility([]).then((r) => {
-        flexBase = r.ranges;
-        // don't clobber a constrained result that may have landed meanwhile
-        if (!allConstraints.length) flexCur = r.ranges;
-      }).catch(() => {});
-    }).catch((e) => (error = (e as Error).message));
-  });
+  // (Re)load everything for the currently-active backend dataset. Called once on
+  // mount and again after a dataset upload/reset, so it also tears down interaction
+  // state that belonged to the previous dataset (pins, tour, constraints, slice…).
+  async function reloadAll() {
+    selected = null; candidates = null; genMsg = null;
+    pins = []; stopMorph(); morphT = 0;
+    if (touring) toggleTour();
+    normTech = null; starAnchors = [];
+    manualConstraints = []; brushConstraints = [];
+    sliceAxis = null; volEstimate = null;
+    facetSel = null;
+    shadowPairs = []; depData = null; // force the dependence/shadow-pair effects to refetch
+    try {
+      const m = await getMeta();
+      meta = m;
+      // an uploaded dataset may not carry the previously-selected axis names
+      if (!m.axes.includes(field)) field = m.axes[0];
+      if (!m.axes.includes(newAxis)) newAxis = m.axes[0];
+      loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
+      const r = await getFlexibility([]);
+      flexBase = r.ranges;
+      // don't clobber a constrained result that may have landed meanwhile
+      if (!allConstraints.length) flexCur = r.ranges;
+    } catch (e) {
+      error = (e as Error).message;
+    }
+  }
+  onMount(reloadAll);
+
+  // ---- dataset upload / reset ----
+  let polyFiles = $state<FileList | null>(null);
+  let sampFiles = $state<FileList | null>(null);
+  let uploadBusy = $state(false);
+  let uploadMsg = $state<string | null>(null);
+  let uploadErr = $state(false);
+
+  async function doUpload() {
+    const p = polyFiles?.[0], s = sampFiles?.[0];
+    if (!p || !s) return;
+    uploadBusy = true; uploadMsg = null; uploadErr = false;
+    try {
+      const r = await uploadDataset(p, s);
+      await reloadAll();
+      uploadMsg = `loaded ${r.n_samples.toLocaleString()} designs`;
+    } catch (e) {
+      uploadMsg = (e as Error).message; uploadErr = true;
+    } finally {
+      uploadBusy = false;
+    }
+  }
+  async function doReset() {
+    uploadBusy = true; uploadMsg = null; uploadErr = false;
+    try {
+      await resetDataset();
+      polyFiles = null; sampFiles = null;
+      await reloadAll();
+      uploadMsg = "restored default";
+    } catch (e) {
+      uploadMsg = (e as Error).message; uploadErr = true;
+    } finally {
+      uploadBusy = false;
+    }
+  }
 
   // ---- axis captions ----
   function topTechs(comp: number[], names: string[], k = 2): string {
@@ -542,6 +600,58 @@
     if (candidates) return candidates.values;
     const v = samples?.values ?? [];
     return subIndex && v.length ? subIndex.map((r) => v[r]) : v;
+  });
+
+  // ---- slice / sweep (cut one axis, watch the other levers' densities & ranges
+  // change) — the "slice the polytope" idea from the supervisor's whiteboard. ----
+  // sampled extent of an axis (where the sample cloud actually is)
+  function axisSpan(axis: string): { j: number; lo: number; hi: number } | null {
+    const j = dispFields.indexOf(axis);
+    if (j < 0 || !dispValues.length) return null;
+    let lo = Infinity, hi = -Infinity;
+    for (const row of dispValues) { const v = row[j]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    return { j, lo, hi };
+  }
+  // exact feasible extent (LP flexibility) — the polytope reaches further than the
+  // samples do, so the slider spans this and marks the sampled sub-range on it.
+  function feasSpan(axis: string): { j: number; lo: number; hi: number } | null {
+    const j = dispFields.indexOf(axis);
+    if (j < 0) return null;
+    const rg = flexBase.find((r) => r.axis === axis);
+    const s = axisSpan(axis);
+    let lo = rg?.min ?? s?.lo ?? 0;
+    let hi = rg?.max ?? s?.hi ?? 1;
+    if (hi <= lo) hi = lo + 1;
+    if (Math.abs(lo) < 1e-6 * (hi - lo)) lo = 0; // snap LP dust (−1e−12) to a clean 0
+    return { j, lo, hi };
+  }
+  const sliceRange = $derived(sliceAxis ? feasSpan(sliceAxis) : null);      // slider bounds
+  const sliceSampled = $derived(sliceAxis ? axisSpan(sliceAxis) : null);    // shaded sub-range
+  function startSlice(axis: string | null) {
+    simPin = null;
+    if (!axis) { exitSlice(); selected = null; return; }
+    // start in the middle of the *sampled* region so the first slice isn't empty
+    const sp = axisSpan(axis) ?? feasSpan(axis);
+    sliceAxis = axis;
+    if (sp) sliceValue = (sp.lo + sp.hi) / 2;
+  }
+  const sliceBand = $derived.by(() => {
+    if (!sliceAxis || !sliceRange) return null;
+    const half = sliceWidth * (sliceRange.hi - sliceRange.lo);
+    return { axis: sliceAxis, lo: sliceValue - half, hi: sliceValue + half };
+  });
+  // Sweeping the slice drives the selection (→ conditional violins on the other
+  // axes) and a live constraint (→ exact flexibility / consequences of fixing it).
+  $effect(() => {
+    const band = sliceBand, r = sliceRange;
+    if (!band || !r) return;
+    const rows: number[] = [];
+    for (let i = 0; i < dispValues.length; i++) {
+      const v = dispValues[i][r.j];
+      if (v >= band.lo && v <= band.hi) rows.push(i);
+    }
+    selected = rows;
+    brushConstraints = [{ axis: band.axis, min: band.lo, max: band.hi }];
   });
   const colorIdx = $derived(
     dispFields.indexOf(field === "chain" ? "net_present_cost" : field),
@@ -598,18 +708,14 @@
       return { min: lo, max: hi };
     });
   });
-  const costIdx = $derived(dispFields.indexOf("net_present_cost"));
-  const techValues = (p: Pin) =>
-    p.values.filter((_, j) => dispFields[j] !== "net_present_cost");
+  const techValues = (p: Pin) => p.values; // all axes are technologies now
 
-  // Interpolated A→B design (full 10-vector) and its 9 technology values, for the
-  // morph radar glyph. Mirrors the white parallel-coords overlay.
+  // Interpolated A→B design (9 technologies) for the morph radar glyph.
+  // Mirrors the white parallel-coords overlay.
   const morphValues = $derived(
     pins.length >= 2 ? lerp(pins[0].values, pins[1].values, morphT) : null,
   );
-  const morphTechValues = $derived(
-    morphValues ? morphValues.filter((_, j) => dispFields[j] !== "net_present_cost") : [],
-  );
+  const morphTechValues = $derived(morphValues ?? []);
 
   // morph state shown on map & parallel coords (uses live-projected pin points)
   const morphPath = $derived(
@@ -705,28 +811,21 @@
   const fmt = (v: number) =>
     Math.abs(v) >= 1000 ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
     : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(3);
-  const deltaCost = (values: number[]) => {
-    if (!meta || costIdx < 0 || !values) return "";
-    const d = ((values[costIdx] - meta.optimum.c_star) / meta.optimum.c_star) * 100;
-    return `${d >= 0 ? "+" : ""}${d.toFixed(1)}%`;
-  };
-
+  // percentage formatter that keeps small values legible (0.02%, not 0.0%)
+  const pct = (v: number) =>
+    v >= 10 ? v.toFixed(0) : v >= 1 ? v.toFixed(1) : v >= 0.01 ? v.toFixed(2) : v.toFixed(3);
   // ---- constraint → consequence readout (§4) ----
   // Synthesizes the exact-LP flexibility (flexBase vs flexCur) into decision terms:
-  // the cost penalty of the current constraints, and which levers they force up or
-  // cap / which options they foreclose.
+  // which technology levers the current constraints force up or cap / which options
+  // they foreclose.
   type Consequence = { axis: string; kind: "force" | "include" | "limit"; text: string; mag: number };
   const consequences = $derived.by(() => {
     if (!allConstraints.length || !meta || !flexBase.length) return null;
-    if (!flexFeasible) return { infeasible: true, costPct: null, items: [] as Consequence[] };
-    const costAxis = meta.cost_axis;
+    if (!flexFeasible) return { infeasible: true, items: [] as Consequence[] };
     const baseBy = new Map(flexBase.map((r) => [r.axis, r]));
-    const curCost = flexCur.find((r) => r.axis === costAxis);
-    const costPct = curCost?.min != null
-      ? ((curCost.min - meta.optimum.c_star) / meta.optimum.c_star) * 100 : null;
     const items: Consequence[] = [];
     for (const cur of flexCur) {
-      if (cur.axis === costAxis || cur.min == null || cur.max == null) continue;
+      if (cur.min == null || cur.max == null) continue;
       const base = baseBy.get(cur.axis);
       if (!base || base.min == null || base.max == null) continue;
       const span = base.max - base.min || 1;
@@ -743,7 +842,71 @@
       }
     }
     items.sort((a, b) => b.mag - a.mag);
-    return { infeasible: false, costPct, items: items.slice(0, 6) };
+    return { infeasible: false, items: items.slice(0, 6) };
+  });
+
+  // ---- volume retained: how much of the near-optimal space survives the current
+  // constraints. Cheap Monte-Carlo estimate = fraction of the uniform sample cloud
+  // that falls in the constrained box (uniform samples → fraction ≈ volume ratio).
+  // Wilson 95% interval for honesty; when 0 samples land the true volume is below
+  // the sampling resolution (1/N), so we report an upper bound instead of "0".
+  const volumeRetained = $derived.by(() => {
+    const cons = allConstraints;
+    const n = dispValues.length;
+    if (!cons.length || !n) return null;
+    const cols = cons
+      .map((c) => ({ j: dispFields.indexOf(c.axis), min: c.min, max: c.max }))
+      .filter((c) => c.j >= 0);
+    if (!cols.length) return null;
+    let k = 0;
+    for (const row of dispValues) {
+      let ok = true;
+      for (const c of cols) {
+        const v = row[c.j];
+        if (c.min != null && v < c.min) { ok = false; break; }
+        if (c.max != null && v > c.max) { ok = false; break; }
+      }
+      if (ok) k++;
+    }
+    const p = k / n;
+    const z = 1.96, z2 = z * z; // Wilson score interval (well-behaved near 0)
+    const denom = 1 + z2 / n;
+    const center = (p + z2 / (2 * n)) / denom;
+    const half = (z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)) / denom;
+    return {
+      k, n,
+      pct: p * 100,
+      lo: Math.max(0, center - half) * 100,
+      hi: Math.min(1, center + half) * 100,
+      resPct: (1 / n) * 100, // sampling resolution: nothing below this is countable
+    };
+  });
+
+  // When the sample count gets too low to trust (deep in the tail), ask the backend
+  // for a subset-simulation estimate — accurate where the raw fraction reads ~0.
+  // Debounced + sequence-guarded like the flexibility fetch.
+  let volEstimate = $state<VolumeEstimate | null>(null);
+  let volBusy = $state(false);
+  let volSeq = 0;
+  let volTimer: ReturnType<typeof setTimeout> | undefined;
+  const VOL_TRUST_K = 200; // ≥ this many samples in-region → the raw fraction is fine
+  $effect(() => {
+    const cons = allConstraints;
+    const vr = volumeRetained;
+    const my = ++volSeq;
+    if (!cons.length || !vr || vr.k >= VOL_TRUST_K) {
+      volEstimate = null; volBusy = false;
+      return;
+    }
+    volBusy = true;
+    volTimer = setTimeout(async () => {
+      try {
+        const r = await getVolume(cons);
+        if (my === volSeq) volEstimate = r;
+      } catch { if (my === volSeq) volEstimate = null; }
+      finally { if (my === volSeq) volBusy = false; }
+    }, 400);
+    return () => { if (volTimer) clearTimeout(volTimer); };
   });
 </script>
 
@@ -824,7 +987,7 @@
         {selected}
         {mode}
         onhover={(i) => (hoverIdx = i)}
-        onselect={(idx) => { selected = idx.length ? idx : null; simPin = null; }}
+        onselect={(idx) => { exitSlice(); selected = idx.length ? idx : null; simPin = null; }}
         onpin={pinRow}
         onspoke={pinExtreme}
         draggableMarkers={isStar && !inCandidates}
@@ -893,6 +1056,36 @@
         {#each meta?.axes ?? [] as a}<option value={a}>{a}</option>{/each}
       </select>
     </label>
+
+    <div class="sect">Slice</div>
+    <label>Slice axis
+      <select value={sliceAxis ?? ""} onchange={(e) => startSlice(e.currentTarget.value || null)}>
+        <option value="">— off —</option>
+        {#each meta?.axes ?? [] as a}<option value={a}>{short(a)}</option>{/each}
+      </select>
+    </label>
+    {#if sliceAxis && sliceRange}
+      {@const span = sliceRange.hi - sliceRange.lo}
+      {@const sLo = sliceSampled ? Math.max(0, Math.min(100, ((sliceSampled.lo - sliceRange.lo) / span) * 100)) : 0}
+      {@const sHi = sliceSampled ? Math.max(0, Math.min(100, ((sliceSampled.hi - sliceRange.lo) / span) * 100)) : 100}
+      {@const inTail = !!sliceSampled && (sliceValue < sliceSampled.lo || sliceValue > sliceSampled.hi)}
+      <div class="slice-track">
+        <div class="slice-base"></div>
+        <div class="slice-sampled" style="left:{sLo}%; right:{100 - sHi}%"></div>
+        <input class="slice-slider" type="range"
+          min={sliceRange.lo} max={sliceRange.hi} step={span / 200}
+          bind:value={sliceValue} />
+      </div>
+      <div class="slice-info">
+        {short(sliceAxis)} ≈ <strong>{fmt(sliceValue)}</strong>
+        {#if inTail}<span class="slice-tail">· thin tail (no samples)</span>{/if}
+      </div>
+      <label class="slice-w">band ±{(sliceWidth * 100).toFixed(0)}%
+        <input type="range" min="0.01" max="0.15" step="0.01" bind:value={sliceWidth} />
+      </label>
+      <span class="muted small">slider spans the full feasible range; the <span class="slice-legend">magenta</span> stretch is where designs are actually sampled · volume retained is under Consequences</span>
+    {/if}
+
     {#if viewMode === "map"}
       <label class="check">
         <input type="checkbox" bind:checked={showOptimum} /> cost optimum ◯
@@ -942,19 +1135,39 @@
       {#if consequences.infeasible}
         <span class="cons-bad">✕ no feasible design under these constraints</span>
       {:else}
-        <div class="cons-cost">
-          {#if consequences.costPct != null && consequences.costPct > 0.05}
-            cost <strong>+{consequences.costPct.toFixed(1)}%</strong> <span class="muted">vs optimum</span>
-          {:else}
-            <span class="muted">no cost penalty</span>
-          {/if}
-          {#if flexBusy}<span class="muted small"> · updating…</span>{/if}
-        </div>
+        {#if flexBusy}<span class="muted small">updating…</span>{/if}
+        {#if volumeRetained}
+          <div class="cons-vol">
+            {#if volumeRetained.k >= 200}
+              <!-- plenty of samples in-region: the raw fraction is reliable -->
+              <span class="vol-num">volume retained ≈ {pct(volumeRetained.pct)}%</span>
+              <span class="vol-ci">95% CI [{pct(volumeRetained.lo)}–{pct(volumeRetained.hi)}%] · {volumeRetained.k.toLocaleString()}/{volumeRetained.n.toLocaleString()} designs</span>
+            {:else if volBusy && !volEstimate}
+              <span class="vol-num">volume retained ≈ estimating…</span>
+              <span class="vol-ci">too few samples land here — running subset simulation</span>
+            {:else if volEstimate && volEstimate.feasible && volEstimate.ratio > 0}
+              <span class="vol-num">volume retained ≈ {pct(volEstimate.ratio * 100)}%</span>
+              <span class="vol-ci">
+                ±{Math.round(volEstimate.cv * 100)}% ({volEstimate.method === "subset_simulation" ? `subset sim, ${volEstimate.levels} levels` : "sample estimate"}) ·
+                {volumeRetained.k.toLocaleString()}/{volumeRetained.n.toLocaleString()} sampled here
+              </span>
+            {:else if volEstimate && !volEstimate.feasible}
+              <span class="vol-num">volume retained ≈ 0%</span>
+              <span class="vol-ci">region is empty (or lower-dimensional)</span>
+            {:else}
+              <span class="vol-num">volume retained &lt; {pct(volumeRetained.resPct)}%</span>
+              <span class="vol-ci">below sampling resolution ({volumeRetained.n.toLocaleString()} samples)</span>
+            {/if}
+          </div>
+        {/if}
         {#each consequences.items as it}
           <div class="cons-item {it.kind}">{it.text}</div>
         {/each}
         {#if !consequences.items.length}
           <span class="muted small">no lever forced or capped yet</span>
+        {/if}
+        {#if volumeRetained && volumeRetained.k < 200}
+          <span class="cons-note">the region stays feasible — the flexibility figures below are exact (LP on the polytope), independent of how many samples land here.</span>
         {/if}
       {/if}
     {/if}
@@ -964,7 +1177,7 @@
       <FlexBars
         base={flexBase}
         current={flexCur.length ? flexCur : flexBase}
-        optimum={[...meta.optimum.u_star, meta.optimum.c_star]}
+        optimum={meta.optimum.u_star}
         feasible={flexFeasible}
         busy={flexBusy}
       />
@@ -1023,6 +1236,32 @@
         <div class="ramp-labels"><span>{fmt(colorData.min)}</span><span>{fmt(colorData.max)}</span></div>
       </div>
     {/if}
+
+    <div class="sect">Dataset</div>
+    <div class="data-box">
+      <div class="data-name" title={meta?.dataset.name}>
+        <span class="data-tag" class:up={meta && !meta.dataset.is_default}>
+          {meta?.dataset.is_default ? "default" : "uploaded"}
+        </span>
+        {meta?.dataset.name ?? "—"}
+      </div>
+      <label class="data-file">polytope&nbsp;.npz
+        <input type="file" accept=".npz" bind:files={polyFiles} disabled={uploadBusy} />
+      </label>
+      <label class="data-file">samples&nbsp;.npz
+        <input type="file" accept=".npz" bind:files={sampFiles} disabled={uploadBusy} />
+      </label>
+      <div class="data-row">
+        <button onclick={doUpload} disabled={uploadBusy || !polyFiles?.length || !sampFiles?.length}>
+          {uploadBusy ? "loading…" : "Load dataset"}
+        </button>
+        {#if meta && !meta.dataset.is_default}
+          <button class="link" onclick={doReset} disabled={uploadBusy}>reset</button>
+        {/if}
+      </div>
+      {#if uploadMsg}<span class="data-msg" class:err={uploadErr}>{uploadMsg}</span>{/if}
+      <span class="muted small">upload a polytope + samples .npz pair (same schema as the shipped data)</span>
+    </div>
   </aside>
 
   <!-- compare tray (right): pinned designs, radar glyphs, A→B morph -->
@@ -1048,7 +1287,6 @@
           <div class="card-head">
             <span class="badge">{String.fromCharCode(65 + i)}</span>
             <span class="card-label">{p.label}</span>
-            <span class="card-cost" title="cost vs optimum">{deltaCost(p.values)}</span>
             <button class="x" onclick={() => removePin(i)}>×</button>
           </div>
           <div class="card-body">
@@ -1085,7 +1323,7 @@
                 size={108}
               />
               <span class="morph-cap muted small">
-                interpolated · t={morphT.toFixed(2)} · {deltaCost(morphValues ?? [])} vs optimum
+                interpolated · t={morphT.toFixed(2)}
               </span>
             </div>
           {/if}
@@ -1123,8 +1361,9 @@
           domainExtra={pcDomainExtraOrd}
           showViolins={true}
           flexRanges={flexCur.length ? flexCur : flexBase}
+          slice={sliceBand}
           {selected}
-          onbrush={(rows, cons) => { selected = rows; brushConstraints = cons; simPin = null; }}
+          onbrush={(rows, cons) => { exitSlice(); selected = rows; brushConstraints = cons; simPin = null; }}
         />
       </div>
     </section>
@@ -1186,9 +1425,57 @@
   }
   .check { flex-direction: row; align-items: center; gap: 6px; color: var(--fg); }
   .check.dis { opacity: 0.45; }
+  /* slice / sweep */
+  /* slice sweep slider spans the feasible range; the sampled sub-range is shaded */
+  .slice-track { position: relative; height: 18px; display: flex; align-items: center; }
+  .slice-base { position: absolute; left: 0; right: 0; height: 4px; border-radius: 2px; background: #2a3441; }
+  .slice-sampled { position: absolute; height: 4px; border-radius: 2px; background: rgba(232, 121, 249, 0.5); }
+  .slice-slider {
+    position: relative; z-index: 1; width: 100%; margin: 0;
+    -webkit-appearance: none; appearance: none; background: transparent;
+  }
+  .slice-slider::-webkit-slider-runnable-track { height: 4px; background: transparent; }
+  .slice-slider::-moz-range-track { height: 4px; background: transparent; }
+  .slice-slider::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 12px; height: 12px; border-radius: 50%; background: #e879f9;
+    margin-top: -4px; cursor: pointer; box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.6);
+  }
+  .slice-slider::-moz-range-thumb {
+    width: 12px; height: 12px; border: none; border-radius: 50%; background: #e879f9; cursor: pointer;
+  }
+  .slice-info { font-size: 12px; color: var(--fg); }
+  .slice-info strong { color: #e879f9; }
+  .slice-tail { color: #f0a14e; font-size: 11px; }
+  .slice-legend { color: #e879f9; }
+  .slice-w { font-size: 11px; color: var(--muted); }
+  .slice-w input { width: 100%; accent-color: #e879f9; }
+  /* dataset upload */
+  .data-box { display: flex; flex-direction: column; gap: 6px; }
+  .data-name {
+    font-size: 11px; color: var(--fg); line-height: 1.3;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .data-tag {
+    display: inline-block; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 1px 5px; border-radius: 4px; margin-right: 4px;
+    background: #2a3441; color: var(--muted);
+  }
+  .data-tag.up { background: rgba(45, 212, 191, 0.2); color: var(--accent); }
+  .data-file { font-size: 11px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
+  .data-file input { font-size: 11px; color: var(--fg); }
+  .data-row { display: flex; gap: 8px; align-items: center; }
+  .data-row button { flex: none; }
+  .data-msg { font-size: 11px; color: var(--accent); line-height: 1.3; }
+  .data-msg.err { color: #e64a3b; }
   /* consequences (§4) */
-  .cons-cost { font-size: 13px; color: var(--fg); }
-  .cons-cost strong { color: #f4b43c; }
+  .cons-vol {
+    display: flex; flex-direction: column; gap: 1px;
+    padding: 4px 8px; border-radius: 6px;
+    background: rgba(45, 212, 191, 0.07); border-left: 3px solid var(--accent);
+  }
+  .vol-num { font-size: 13px; color: var(--fg); font-weight: 600; }
+  .vol-ci { font-size: 10px; color: var(--muted); }
   .cons-item {
     font-size: 12px; padding: 3px 8px; border-radius: 6px; border-left: 3px solid;
     background: rgba(255, 255, 255, 0.03);
@@ -1197,6 +1484,10 @@
   .cons-item.include { border-color: #e64a3b; }
   .cons-item.limit { border-color: #2e8cdc; }
   .cons-bad { color: #e64a3b; font-size: 13px; }
+  .cons-note {
+    font-size: 11px; color: var(--muted); font-style: italic; line-height: 1.3;
+    border-left: 3px solid rgba(45, 212, 191, 0.5); padding: 2px 8px;
+  }
   .info { margin-top: 4px; font-size: 13px; }
   .info p { margin: 4px 0; }
   .muted { color: var(--muted); }
@@ -1264,7 +1555,6 @@
     color: #0a0e14; font-size: 10px; font-weight: 800; line-height: 17px; text-align: center; flex: none;
   }
   .card-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .card-cost { color: var(--muted); font-size: 11px; }
   .x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; }
   .x:hover { color: #f85149; }
   .card-body { display: flex; align-items: center; gap: 8px; margin-top: 4px; }

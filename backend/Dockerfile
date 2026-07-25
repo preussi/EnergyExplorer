@@ -11,14 +11,7 @@ COPY app ./app
 # self-contained on Kubernetes (no data volume to provision).
 COPY data ./data
 
-ENV DATA_DIR=/app/data \
-    CACHE_DIR=/app/cache
-
-# Precompute the expensive t-SNE/UMAP projections into the image. On Kubernetes
-# there is no cache volume (helm pvcs: []), so without this the deployment would
-# only serve PCA and return HTTP 425 for t-SNE/UMAP. Building here also guarantees
-# the cache always matches the baked-in data (never stale).
-RUN python -m app.projections
+ENV DATA_DIR=/app/data
 
 EXPOSE 8000
 

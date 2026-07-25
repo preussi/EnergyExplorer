@@ -17,6 +17,7 @@
     domainExtra = [],
     showViolins = false,
     flexRanges = [],
+    slice = null,
     onbrush,
   }: {
     fields: string[];
@@ -40,6 +41,8 @@
     // exact LP feasible [min,max] per axis under current constraints, drawn as a
     // band on each axis (physical units, matched to fields by `axis` name).
     flexRanges?: { axis: string; min: number | null; max: number | null }[];
+    // active slice/sweep band on one axis (highlighted so you see where the cut is).
+    slice?: { axis: string; lo: number; hi: number } | null;
     onbrush?: (
       rows: number[] | null,
       constraints: { axis: string; min: number; max: number }[],
@@ -405,6 +408,17 @@
             height={Math.max(2, scales[a](brushes[a]![0]) - scales[a](brushes[a]![1]))}
           />
         {/if}
+        {#if slice && slice.axis === f}
+          <rect
+            class="slice-band"
+            x={xPos[a] - 12}
+            y={scales[a](slice.hi)}
+            width="24"
+            height={Math.max(2, scales[a](slice.lo) - scales[a](slice.hi))}
+          />
+          <line class="slice-mid" x1={xPos[a] - 12} y1={scales[a]((slice.lo + slice.hi) / 2)}
+            x2={xPos[a] + 12} y2={scales[a]((slice.lo + slice.hi) / 2)} />
+        {/if}
       {/if}
     {/each}
   </svg>
@@ -419,4 +433,6 @@
   .tick { fill: var(--muted); font-size: 9px; text-anchor: middle; }
   .tick.bot { dominant-baseline: hanging; }
   .brush { fill: rgba(45, 212, 191, 0.18); stroke: var(--accent); stroke-width: 1; pointer-events: none; }
+  .slice-band { fill: rgba(232, 121, 249, 0.16); stroke: #e879f9; stroke-width: 1; pointer-events: none; }
+  .slice-mid { stroke: #e879f9; stroke-width: 1.5; pointer-events: none; }
 </style>

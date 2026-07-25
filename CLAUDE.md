@@ -20,41 +20,53 @@ frontend (nginx)  Svelte 5 + Vite + regl-scatterplot
    WebGL scatter of 20k designs · parallel coords · radar glyphs · overlays
    /api/* proxied to backend
 backend (FastAPI)  numpy + scikit-learn + scipy
-   loads .npz at startup · PCA live · t-SNE/UMAP precomputed+cached ·
-   clusters · extremes (LP) · generation (LP feasibility + hit-and-run)
+   loads .npz at startup · PCA live (only projection) · clusters ·
+   extremes (LP) · generation (LP feasibility + hit-and-run)
 ```
+Frontend default view is **Profiles** (violin parallel-coords). Projections offered:
+**PCA** + **STAR** (star coordinates, frontend). t-SNE/UMAP were removed.
 
 ## Layout
 
 - `backend/app/` — `main.py` (routes), `data.py` (`Dataset`, npz loading,
-  norm↔phys), `projections.py` (PCA/t-SNE/UMAP + cache builder), `generate.py`
+  norm↔phys), `projections.py` (PCA only, live), `generate.py`
   (steering/candidate generation).
 - `backend/data/` — `polytope_NN.npz`, `polytope_samples_NN.npz` (versioned;
-  currently v08). The loader (`data.py:_resolve`) auto-picks the newest suffix.
-- `backend/cache/` — precomputed t-SNE/UMAP `.npy`, mounted as a volume.
+  currently **v13**). The loader (`data.py:_resolve`) auto-picks the newest suffix.
 - `backend/scripts/npz_to_csv.py` — npz → `data/csv/` export helper.
 - `frontend/src/lib/` — `ScatterGL`, `ParallelCoords`, `FacetView`,
   `DependenceMatrix`, `RadarGlyph`, `StarWheel`, `FlexBars`, `api.ts`, `colors.ts`.
 
-## Data (10 axes = 9 technologies + net present cost)
+## Data — 9 axes = 9 technologies (cost is NOT a design axis)
 
 Axes: `nuclear, photovoltaics, wind_offshore, wind_onshore, electrolysis, DAC,
-battery, ccs_lump, biomass, net_present_cost`.
+battery, ccs_lump, biomass`.
 
-- `polytope_NN.npz` — `A`, `b`, `X`: polytope `{x : A·x ≤ b}` (v08: 429 rows).
-  **`z_star`** = the real cost optimum (9-D physical techs). **`u_star`** = per-axis
-  normalization maxima, **NOT** the optimum (see below).
-- `polytope_samples_NN.npz` — 20k uniform samples from **two samplers** (`chrrt`,
-  `har`), each in **normalized** (`*_norm`, ~[0,1], use for projections/distance)
-  and **physical** (`*_phys`, GW/MtCO₂/NPC, use for tooltips/axis labels) units;
-  `round_transformation`/`round_shift` map between them; `config["c_star"]` =
-  optimal cost, `config["z_star_physical"]` = optimum.
+- `polytope_NN.npz` — `A`(m,10), `b`, `X`, `name_list` (10, last = cost). At load,
+  `data.py` **Fourier–Motzkin projects cost out** → a clean **9-D** technology
+  polytope `{x : A·x ≤ b}` (~219 rows) with near-optimality (`cost ≤ (1+ε)c*`)
+  baked in. **`z_star`** = the cost optimum (9-D techs); **`u_star`** = per-axis
+  fmax normalization maxima (`phys = norm × u_star`), **NOT** the optimum.
+- `polytope_samples_NN.npz` (schema v2) — key `samples` (N, **9**), fmax-normalized
+  technologies from a **single** hit-and-run sampler; `chain_id`, `rhat`,
+  `ess_bulk`. v13 ships ~410k samples; `data.py` caps to `MAX_SAMPLES` (40k, seeded)
+  for a manageable payload. Cost was dropped entirely (2026-07 migration).
 
 ## API (backend/app/main.py)
 
 `/api/health`, `/api/meta`, `/api/projection`, `/api/color`, `/api/samples`,
 `/api/extremes`, `/api/dependence`, `/api/shadow_pairs`, `POST /api/shadow`,
-`POST /api/flexibility`, `POST /api/generate`, `/api/clusters`.
+`POST /api/flexibility`, `POST /api/volume`, `POST /api/generate`, `/api/clusters`,
+`POST /api/upload` (multipart polytope+samples .npz → swaps the active dataset),
+`POST /api/reset` (restore the shipped default).
+
+**Data uploading.** The active dataset is a module-global override in `data.py`
+(`get_dataset` returns the uploaded `Dataset` if `set_active` was called, else the
+file-based default). Uploads must match the shipped schema (`validate_npz` checks
+keys/shapes, 422 on mismatch). Swapping datasets must call `generate.reset_caches()`
+— the shadow/dependence/extremes/flex caches are keyed globally, not per dataset.
+Frontend `reloadAll()` re-fetches every view after upload/reset. nginx needs
+`client_max_body_size` raised (samples .npz is tens of MB).
 
 ## Dev / commands
 
@@ -67,19 +79,17 @@ cd frontend && npm run dev                # Vite proxies /api → 127.0.0.1:8000
 
 # quality gates (run before pushing)
 cd frontend && npm run check && npm run build
-
-# build projection cache (t-SNE/UMAP; persisted via ./backend/cache volume)
-docker compose exec backend python -m app.projections [--force]
 ```
 
-Deploys to ETH IVIA via `helm/` (see commit history / CI).
+Deploys to ETH IVIA via `helm/` (see commit history / CI). No projection cache /
+PVC anymore (PCA is live).
 
 ## Gotchas (learned the hard way — see PROCESSES.md §14)
 
-- **PCA runs live; t-SNE/UMAP must be precomputed** (seconds–minutes on 20k pts).
-  Until a cache file exists the endpoint returns HTTP 425.
-- **Two normalizations.** Use `*_norm` for projection/distance; `*_phys` only for
-  display. Don't compute Euclidean distance on physical units.
+- **PCA is the only backend projection, computed live.** t-SNE/UMAP removed; STAR
+  is a frontend linear projection. No cache, no HTTP 425.
+- **fmax normalization.** `phys = norm × u_star` for the 9 techs (offset 0). Use
+  `*_norm` for projection/distance, `*_phys` for display.
 - **Docker images are immutable** — edits need `docker compose build <svc> &&
   up -d <svc>`; "my changes vanished" = stale image.
 - **Vite proxy targets `127.0.0.1`, not `localhost`** (Node ≥17 IPv6 `::1` vs

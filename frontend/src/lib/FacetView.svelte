@@ -141,17 +141,31 @@
   // scales over the base shadow's bounding box (padded)
   const xi = $derived(sel ? fields.indexOf(sel.x) : -1);
   const yi = $derived(sel ? fields.indexOf(sel.y) : -1);
-  const domain = $derived.by(() => {
+  // True feasible extent of the shadow (exact LP min/max of each axis over the
+  // polytope) — this is what the violins below use as their axis domain too, so
+  // the tick labels must show *these* numbers, not the padded drawing domain.
+  const extent = $derived.by(() => {
     if (!baseShadow?.polygon.length) return null;
     const xs = baseShadow.polygon.map((p) => p[0]);
     const ys = baseShadow.polygon.map((p) => p[1]);
-    const px = (Math.max(...xs) - Math.min(...xs)) * 0.06 || 1;
-    const py = (Math.max(...ys) - Math.min(...ys)) * 0.06 || 1;
     return {
-      x: [Math.min(...xs) - px, Math.max(...xs) + px] as [number, number],
-      y: [Math.min(...ys) - py, Math.max(...ys) + py] as [number, number],
+      x: [Math.min(...xs), Math.max(...xs)] as [number, number],
+      y: [Math.min(...ys), Math.max(...ys)] as [number, number],
     };
   });
+  // Drawing domain: pad 6% so the polygon isn't flush against the axes. Padding
+  // never leaks into the labels, and we never pad *below* a true 0 (technology
+  // capacities are non-negative — a padded −6.6 would be nonsensical).
+  const domain = $derived.by(() => {
+    if (!extent) return null;
+    const pad = ([lo, hi]: [number, number]): [number, number] => {
+      const d = (hi - lo) * 0.06 || 1;
+      return [lo - (lo <= 0 ? 0 : d), hi + d];
+    };
+    return { x: pad(extent.x), y: pad(extent.y) };
+  });
+  // snap numerical −0 / floating-point dust (e.g. LP min = −1e−12) to a clean 0
+  const tickFmt = (v: number, span: number) => fmt(Math.abs(v) < 1e-6 * (span || 1) ? 0 : v);
   const sx = $derived(domain ? scaleLinear().domain(domain.x).range([M.left, W - M.right]) : null);
   const sy = $derived(domain ? scaleLinear().domain(domain.y).range([H - M.bottom, M.top]) : null);
 
@@ -212,6 +226,10 @@
   <div class="main">
     <div class="plot" bind:this={plotEl}>
       <canvas bind:this={ptsCanvas}></canvas>
+      {#if sel}
+        <button class="swap" onclick={() => sel && (sel = { x: sel.y, y: sel.x })}
+                title="swap the x and y axes">⇄ swap axes</button>
+      {/if}
       {#if sx && sy && baseShadow}
         <svg>
           <!-- base shadow boundary -->
@@ -224,12 +242,13 @@
           {/if}
           <!-- optimum -->
           <circle cx={sx(baseShadow.optimum[0])} cy={sy(baseShadow.optimum[1])} r="5.5" class="opt" />
-          <!-- axes ticks (min/max) -->
-          {#if domain}
-            <text x={M.left} y={H - M.bottom + 16} class="tick">{fmt(domain.x[0])}</text>
-            <text x={W - M.right} y={H - M.bottom + 16} class="tick end">{fmt(domain.x[1])}</text>
-            <text x={M.left - 6} y={H - M.bottom} class="tick end">{fmt(domain.y[0])}</text>
-            <text x={M.left - 6} y={M.top + 8} class="tick end">{fmt(domain.y[1])}</text>
+          <!-- axis ticks: the true feasible min/max (LP extent), placed at the
+               polygon edges — matches the violin axes below -->
+          {#if extent}
+            <text x={sx(extent.x[0])} y={H - M.bottom + 16} class="tick">{tickFmt(extent.x[0], extent.x[1] - extent.x[0])}</text>
+            <text x={sx(extent.x[1])} y={H - M.bottom + 16} class="tick end">{tickFmt(extent.x[1], extent.x[1] - extent.x[0])}</text>
+            <text x={M.left - 6} y={sy(extent.y[0])} class="tick end">{tickFmt(extent.y[0], extent.y[1] - extent.y[0])}</text>
+            <text x={M.left - 6} y={sy(extent.y[1]) + 8} class="tick end">{tickFmt(extent.y[1], extent.y[1] - extent.y[0])}</text>
           {/if}
         </svg>
         <div class="axis-x">{short(baseShadow.x)} →</div>
@@ -242,7 +261,7 @@
       {/if}
     </div>
     <p class="caption muted">
-      solid outline = exact boundary of the near-optimal space (LP shadow) · teal = under your constraints · ◯ = optimum
+      solid outline = exact boundary of the near-optimal space (LP shadow) · dots = sampled designs (rarely reach the extreme corners, so the violins below look narrower) · teal = under your constraints · ◯ = optimum
     </p>
   </div>
 
@@ -283,6 +302,14 @@
   .plot { position: relative; flex: 1; min-height: 0; }
   .plot canvas, .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; }
   .plot svg { overflow: visible; pointer-events: none; }
+
+  .swap {
+    position: absolute; top: 8px; right: 8px; z-index: 2;
+    font-size: 11px; padding: 3px 9px; border-radius: 7px;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--fg); cursor: pointer;
+  }
+  .swap:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--accent); }
 
   .base-poly {
     fill: rgba(255, 255, 255, 0.025);

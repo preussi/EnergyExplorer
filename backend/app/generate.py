@@ -101,6 +101,18 @@ _SHADOW_PAIRS_CACHE: list | None = None
 _FLEX_BASE_CACHE: dict | None = None
 
 
+def reset_caches() -> None:
+    """Clear every polytope-derived cache. Call this whenever the active dataset
+    changes (upload / reset) — all caches assume a single static polytope and are
+    keyed globally, not per dataset."""
+    global _SHADOW_PAIRS_CACHE, _FLEX_BASE_CACHE
+    _SHADOW_CACHE.clear()
+    _SHADOW_PAIRS_CACHE = None
+    _FLEX_BASE_CACHE = None
+    _DEPENDENCE_CACHE.clear()
+    _EXTREMES_CACHE.clear()
+
+
 def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
     """Exact 2-D shadow (orthogonal projection) of the (optionally constrained)
     polytope onto two axes, via support-function LPs: for each direction theta,
@@ -292,6 +304,95 @@ def flexibility(ds, constraints=None):
     return result
 
 
+def volume_ratio(ds, constraints, seed: int = 42, pop: int = 4000,
+                 p0: float = 0.1, max_levels: int = 12):
+    """Relative volume of the constrained region vs the full near-optimal space:
+    ``vol({Ax<=b} ∩ box) / vol({Ax<=b})`` — i.e. "how much of the design space
+    survives these constraints".
+
+    The uniform-sample fraction (computed client-side) answers this directly when
+    the region is not too small, but lands *zero* points once the region drops
+    below ~1/N of the volume — exactly the tail the user cares about. This is a
+    **subset-simulation** (multilevel-splitting) estimator that stays accurate
+    there, reusing the same hit-and-run sampler.
+
+    The box is the extra halfspaces ``r·x <= β`` (from :func:`build_constraints`).
+    Define a normalized violation ``h(x) = max_r (r·x - β_r)/scale_r``; the target
+    region is ``{h <= 0}``. We lower an intermediate threshold ``h_ℓ`` level by
+    level so each conditional probability is ≈ ``p0``, drawing hit-and-run samples
+    restricted to ``{Ax<=b, r·x <= β_r + h_ℓ·scale_r}`` (still a polytope), and
+    multiply the per-level conditionals. Reaching 1e-8 takes ~8 levels, not the
+    ~1e8 samples a naive count would need.
+    """
+    rows, bnds = build_constraints(ds, constraints or [])
+    if not rows:
+        return {"feasible": True, "ratio": 1.0, "log10": 0.0, "levels": 0,
+                "method": "trivial", "cv": 0.0}
+    R = np.asarray(rows, dtype=float)          # (q, n) box halfspaces
+    beta = np.asarray(bnds, dtype=float)       # (q,)
+    A0, b0 = ds.A, ds.b
+    n = A0.shape[1]
+    bounds = [(None, None)] * n
+
+    # non-empty target? (thin slabs have ~0 inscribed radius but are still feasible)
+    x0t, _ = chebyshev_center(np.vstack([A0, R]), np.concatenate([b0, beta]))
+    if x0t is None:
+        return {"feasible": False, "ratio": 0.0, "log10": None, "levels": 0,
+                "method": "empty", "cv": 0.0}
+
+    # per-row violation scale = max positive excess of that row over the base body
+    scale = np.empty(len(R))
+    for k in range(len(R)):
+        res = linprog(-R[k], A_ub=A0, b_ub=b0, bounds=bounds, method="highs")
+        excess = (-float(res.fun) - beta[k]) if res.success else 1.0
+        scale[k] = excess if excess > 1e-9 else 1.0
+
+    def hvals(X):
+        return ((X @ R.T - beta) / scale).max(axis=1)
+
+    rng = np.random.default_rng(seed)
+    # level 0: reuse the precomputed uniform cloud (cheap, already uniform on {Ax<=b})
+    base = ds.get_samples(None, "norm")
+    X = base[rng.choice(len(base), min(pop, len(base)), replace=False)]
+    h = hvals(X)
+    x0_base, _ = chebyshev_center(A0, b0)
+
+    prob = 1.0
+    levels = 0
+    while True:
+        frac = float((h <= 0.0).mean())
+        if frac >= p0 or levels >= max_levels:
+            prob *= max(frac, 1.0 / (pop * (levels + 1)))   # final direct estimate
+            break
+        ht = float(np.quantile(h, p0))          # threshold letting ≈ p0 through
+        if ht <= 0.0:
+            prob *= max(frac, 1.0 / pop)
+            break
+        prob *= p0
+        levels += 1
+        seeds = X[h <= ht]
+        start = seeds[rng.integers(len(seeds))] if len(seeds) else x0_base
+        Al = np.vstack([A0, R])
+        bl = np.concatenate([b0, beta + ht * scale])
+        X = hit_and_run(Al, bl, pop, start, seed=seed + levels)
+        if len(X) == 0:                          # sampler stalled; stop conservatively
+            break
+        h = hvals(X)
+
+    # subset-simulation CV (rough; ignores MCMC autocorrelation → optimistic):
+    # δ² ≈ Σ_ℓ (1 - p0) / (p0 · pop). Report as a multiplicative band.
+    cv = float(np.sqrt(levels * (1.0 - p0) / (p0 * pop))) if levels else \
+        float(np.sqrt(max(1.0 - prob, 0.0) / (prob * pop))) if prob > 0 else 0.0
+    return {
+        "feasible": True,
+        "ratio": float(prob),
+        "log10": (float(np.log10(prob)) if prob > 0 else None),
+        "levels": int(levels),
+        "method": "direct" if levels == 0 else "subset_simulation",
+        "cv": cv,
+    }
+
+
 # sampler -> list of extreme designs (computed once; the polytope is static)
 _EXTREMES_CACHE: dict[str, list] = {}
 
@@ -325,7 +426,6 @@ def extremes(ds, sampler: str):
                 "kind": kind,
                 "values": phys.tolist(),
                 "point": pt.astype(float).tolist(),
-                "cost": float(phys[ds.cost_idx]),
             })
     _EXTREMES_CACHE[sampler] = out
     return out

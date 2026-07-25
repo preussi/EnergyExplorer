@@ -377,6 +377,50 @@ instead of boxiness. A companion scatter plots **dCor vs (1 − boxiness)** per
 pair: the up-right trend is a built-in cross-check that the sampled cloud's
 dependence matches the polytope's exact facet structure (a sampler sanity test).
 
+### 10.12 Volume retained (how much of the space survives) — subset simulation
+The Consequences panel answers *"how much smaller does the near-optimal space get
+under these constraints?"* as a **relative volume**:
+`vol({Ax≤b} ∩ box) / vol({Ax≤b})`, where the box is the current constraint set
+(manual + brush + slice). Because the samples are **uniform** on the polytope, the
+fraction of the sample cloud that falls in the box is already a Monte-Carlo
+estimate of this ratio — computed client-side, with a **Wilson 95% interval** for
+honesty. This is the quantitative form of the slice idea: sweep a slice and watch
+the retained volume shrink.
+
+The catch is the **tail**. Once the box drops below ~1/N of the volume, *zero*
+samples land in it — the old "0 selected, but still feasible" confusion. So when
+fewer than **200** samples land in-region (where the raw fraction gets noisy or
+zero), the frontend debounce-fetches `POST /api/volume`, a **subset-simulation**
+(multilevel-splitting) estimate — the standard rare-event Monte-Carlo technique —
+that reuses the same hit-and-run sampler:
+
+- Write the box as extra halfspaces `r·x ≤ βᵣ` and define a normalized violation
+  `h(x) = maxᵣ (r·x − βᵣ)/scaleᵣ` (each `scaleᵣ` = that row's max positive excess
+  over the base polytope, from one support LP). The target region is `{h ≤ 0}`.
+- Lower an intermediate threshold `h_ℓ` level by level so each **conditional**
+  probability `P(h ≤ h_{ℓ+1} | h ≤ h_ℓ) ≈ p₀` (= 0.1): pick `h_ℓ` as the p₀-quantile
+  of `h` over the current population, then draw a fresh population with hit-and-run
+  restricted to `{Ax ≤ b, r·x ≤ βᵣ + h_ℓ·scaleᵣ}` — still a polytope, so the sampler
+  is unchanged. Level 0 reuses the precomputed uniform cloud (already uniform on
+  `{Ax≤b}`), so it's free.
+- Multiply the per-level conditionals: `ratio = p₀^L · (final in-target fraction)`.
+  Reaching 10⁻⁸ takes ~8 levels (~8·pop samples), not the ~10⁸ a naive count needs.
+
+The response carries `ratio`, `log10`, `levels`, `method` (`trivial` / `direct` /
+`subset_simulation` / `empty`) and an approximate coefficient of variation `cv`
+(`δ² ≈ Σ_ℓ (1−p₀)/(p₀·pop)`; it ignores MCMC autocorrelation, so it's optimistic —
+shown as a `±cv%` band, not a hard interval). The UI shows the raw fraction + CI
+when ≥ 200 samples land, otherwise the subset-sim estimate, otherwise
+`< (1/N)%` as an upper bound. **Validation:** in the bulk the estimator matches
+the raw fraction within ~2 % (0.40 vs 0.41; 0.119 vs 0.125); in the deep tail it is
+seed-stable to a few ×10⁻⁴. There the estimator and the raw 400k-sample fraction
+can disagree by ~5× — expected, since the upstream samples are a **single** MCMC
+chain that under-samples deep-tail corners exactly where subset simulation pushes;
+both are estimates good to roughly a factor there, so tail values are
+order-of-magnitude, not two-sig-fig. The **exact** feasibility and per-lever LP
+ranges (§10.9) are unaffected — they hold at any constraint depth regardless of how
+many samples land.
+
 ## 11. Interaction model
 
 - **Linked selection** — one row-index set drives both views: lasso (Select
@@ -415,7 +459,10 @@ any technology (phys or norm units), or chain id.
 | `/api/dependence?sampler` | GET | 10×10 distance-correlation, mutual-information & Pearson matrices (cached, 1.5k subsample) |
 | `/api/shadow` | POST | exact 2-D shadow polygon of the (constrained) polytope |
 | `/api/flexibility` | POST | exact remaining [min,max] per axis under constraints |
+| `/api/volume` | POST | relative volume of the constrained region vs the full space (subset-simulation estimate; accurate in the tail) |
 | `/api/generate` | POST | constraints → feasibility LP → hit-and-run candidates + PCA coords |
+| `/api/upload` | POST | multipart polytope + samples `.npz` → validated (schema-checked) and swapped in as the active dataset; clears all polytope-derived caches |
+| `/api/reset` | POST | discard an uploaded dataset and restore the shipped default |
 
 ## 14. Development & deployment workflow
 

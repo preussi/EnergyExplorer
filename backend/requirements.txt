@@ -1,5 +1,5 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+python-multipart==0.0.20
 numpy>=2.0
 scikit-learn>=1.5
-umap-learn>=0.5   # UMAP support for the projection cache builder

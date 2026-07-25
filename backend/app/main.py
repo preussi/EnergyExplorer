@@ -1,18 +1,30 @@
 """FastAPI app: serves metadata, projections and raw sample values."""
 from __future__ import annotations
 
+import io
+
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from .data import SAMPLERS, SPACES, get_dataset
+from .data import (
+    SPACES,
+    Dataset,
+    get_dataset,
+    is_default,
+    reset_active,
+    set_active,
+    validate_npz,
+)
 from .generate import dependence as run_dependence
+from .generate import reset_caches
 from .generate import extremes as run_extremes
 from .generate import flexibility as run_flexibility
 from .generate import generate as run_generate
 from .generate import shadow as run_shadow
 from .generate import shadow_pairs as run_shadow_pairs
+from .generate import volume_ratio as run_volume
 from .projections import METHODS, project
 
 app = FastAPI(title="Energy Explorer API", version="0.1.0")
@@ -37,19 +49,64 @@ def meta():
     ds = get_dataset()
     return {
         "axes": ds.axes,
-        "samplers": list(SAMPLERS),
         "methods": list(METHODS),
         "spaces": list(SPACES),
         "n_samples": ds.n_samples,
-        "cost_axis": ds.axes[ds.cost_idx],
         "optimum": {
-            "u_star": ds.u_star.tolist(),
-            "c_star": ds.c_star,
+            "u_star": ds.u_star.tolist(),   # the cost optimum, technologies only
             "epsilon": ds.epsilon,
             "norm": ds.optimum_norm.tolist(),
         },
         "diagnostics": ds.diagnostics,
+        "dataset": {"name": ds.name, "is_default": is_default()},
     }
+
+
+def _load_npz_upload(file: UploadFile, kind: str):
+    """Read an uploaded .npz into memory, or raise a 400 with a clear message."""
+    if not file.filename or not file.filename.lower().endswith(".npz"):
+        raise HTTPException(status_code=400, detail=f"{kind} file must be a .npz")
+    try:
+        return np.load(io.BytesIO(file.file.read()), allow_pickle=True)
+    except Exception as e:  # noqa: BLE001 — surface any npz read failure to the user
+        raise HTTPException(status_code=400, detail=f"could not read {kind} .npz: {e}")
+
+
+@app.post("/api/upload")
+def upload(polytope: UploadFile = File(...), samples: UploadFile = File(...)):
+    """Replace the active dataset with an uploaded polytope + samples pair (same
+    schema as the shipped data). Validated before swap; on success all
+    polytope-derived caches are cleared so every view recomputes on the new data."""
+    poly = _load_npz_upload(polytope, "polytope")
+    samp = _load_npz_upload(samples, "samples")
+
+    problems = validate_npz(poly, samp)
+    if problems:
+        raise HTTPException(status_code=422, detail={"errors": problems})
+
+    name = f"{polytope.filename} + {samples.filename}"
+    try:
+        ds = Dataset(poly, samp, name=name)
+    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
+        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
+
+    set_active(ds)
+    reset_caches()
+    return {
+        "ok": True,
+        "dataset": {"name": ds.name, "is_default": False},
+        "axes": ds.axes,
+        "n_samples": ds.n_samples,
+    }
+
+
+@app.post("/api/reset")
+def reset():
+    """Discard any uploaded dataset and restore the shipped default."""
+    reset_active()
+    reset_caches()
+    ds = get_dataset()
+    return {"ok": True, "dataset": {"name": ds.name, "is_default": True}}
 
 
 @app.get("/api/projection")
@@ -94,20 +151,11 @@ def projection(
 @app.get("/api/color")
 def color(
     sampler: str = Query("chrrt"),
-    field: str = Query("net_present_cost", description="axis name or 'chain'"),
+    field: str = Query("nuclear", description="technology axis name"),
     space: str = Query("phys"),
 ):
     """Per-sample scalar used to color the scatter, aligned to sample row order."""
     ds = get_dataset()
-    if field == "chain":
-        vals = ds.chain_ids()
-        return {
-            "field": "chain",
-            "values": vals.astype(int).tolist(),
-            "min": 0,
-            "max": int(vals.max()),
-            "categorical": True,
-        }
     if field not in ds.axes:
         raise HTTPException(status_code=400, detail=f"unknown field {field!r}")
     try:
@@ -154,8 +202,6 @@ def extremes(sampler: str = Query("chrrt")):
     """MGA extreme designs: per technology, its min and max over the polytope
     (LP vertices), as physical values + base-PCA coordinates."""
     ds = get_dataset()
-    if sampler not in SAMPLERS:
-        raise HTTPException(status_code=400, detail=f"unknown sampler {sampler!r}")
     return {"sampler": sampler, "extremes": run_extremes(ds, sampler)}
 
 
@@ -188,8 +234,6 @@ def dependence(sampler: str = Query("chrrt")):
     information, and Pearson. Distance correlation/MI catch the nonlinear coupling
     that Pearson misses in the uniform near-optimal cloud."""
     ds = get_dataset()
-    if sampler not in SAMPLERS:
-        raise HTTPException(status_code=400, detail=f"unknown sampler {sampler!r}")
     return run_dependence(ds, sampler)
 
 
@@ -216,13 +260,21 @@ def flexibility(req: FlexibilityRequest):
     return run_flexibility(ds, [c.model_dump() for c in req.constraints])
 
 
+@app.post("/api/volume")
+def volume(req: FlexibilityRequest):
+    """Relative volume of the constrained near-optimal region vs the whole space
+    ('how much of the design space survives these constraints'). Subset-simulation
+    estimate so it stays accurate deep in the tail, where the uniform-sample
+    fraction the UI computes lands zero points."""
+    ds = get_dataset()
+    return run_volume(ds, [c.model_dump() for c in req.constraints])
+
+
 @app.post("/api/generate")
 def generate(req: GenerateRequest):
     """Add the user's constraints to the polytope and re-sample fresh candidate
     designs from the constrained near-optimal region (projected into PCA space)."""
     ds = get_dataset()
-    if req.sampler not in SAMPLERS:
-        raise HTTPException(status_code=400, detail=f"unknown sampler {req.sampler!r}")
     cons = [c.model_dump() for c in req.constraints]
     return run_generate(ds, req.sampler, req.n, cons, seed=req.seed)
 
