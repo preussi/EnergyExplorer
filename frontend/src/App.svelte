@@ -1,12 +1,14 @@
 <script lang="ts">
   import {
     getMeta, getProjection, getColor, getSamples, getClusters, getExtremes, generate,
-    getFlexibility, getVolume, getDependence, getShadowPairs, uploadDataset, resetDataset,
+    getFlexibility, getVolume, getDependence, getShadowPairs,
     type Meta, type Projection, type ColorData, type SamplesData, type ClustersData,
     type GenerateResult, type ConstraintInput, type ExtremeDesign, type FlexRange,
     type VolumeEstimate, type Dependence, type DependenceMetric, type ShadowPair,
   } from "./lib/api";
-  import { onMount } from "svelte";
+  import { fly } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
+  import Landing from "./lib/Landing.svelte";
   import ScatterGL from "./lib/ScatterGL.svelte";
   import ParallelCoords from "./lib/ParallelCoords.svelte";
   import RadarGlyph from "./lib/RadarGlyph.svelte";
@@ -29,7 +31,7 @@
 
   let method = $state("pca");
   const sampler = "chrrt"; // sampler choice removed from UI; chrrt is the default view
-  let field = $state("nuclear");
+  let field = $state(""); // "" = no color encoding (default)
   let showOptimum = $state(true);
   let showClusters = $state(true);
 
@@ -58,8 +60,12 @@
   let depData = $state<Dependence | null>(null);
   let depMetric = $state<DependenceMetric>("dcor");
   let shadowPairs = $state<ShadowPair[]>([]);   // boxiness per pair (for the dCor-vs-boxiness check)
-  // a pair to open in the Facets tab (set by clicking a heatmap cell)
+  // a pair to open in the Facets tab (set by clicking a heatmap cell); one-shot,
+  // FacetView consumes and clears it (see onconsumepair).
   let facetSel = $state<{ x: string; y: string } | null>(null);
+  // whether the Coupling view's docked Facet panel is open (persists across the
+  // one-shot facetSel so re-clicking cells doesn't close it). null = closed.
+  let couplingPair = $state<{ x: string; y: string } | null>(null);
 
   // ---- star coordinates (user-steered linear projection) ----
   const isStar = $derived(method === "star");
@@ -428,6 +434,7 @@
     finally { loading = false; }
   }
   async function loadColor() {
+    if (!field) { colorData = null; return; } // no encoding → uniform color everywhere
     // Color is always fetched in physical units. (Color is min-max normalized,
     // and phys = scale*norm + offset per axis, so normalized vs physical produce
     // identical colors — only the legend's numeric bounds would differ. Physical
@@ -443,7 +450,7 @@
     catch (e) { console.warn("samples load failed:", e); }
   }
   async function loadClusters() {
-    try { clustersData = await getClusters(fetchMethod, sampler, 6); }
+    try { clustersData = await getClusters(fetchMethod, sampler, clusterK); }
     catch { clustersData = null; }
   }
   async function loadExtremes() {
@@ -505,13 +512,15 @@
     normTech = null; starAnchors = [];
     manualConstraints = []; brushConstraints = [];
     sliceAxis = null; volEstimate = null;
-    facetSel = null;
+    facetSel = null; couplingPair = null;
     shadowPairs = []; depData = null; // force the dependence/shadow-pair effects to refetch
     try {
       const m = await getMeta();
       meta = m;
+      dimEnabled = Object.fromEntries(m.axes.map((a) => [a, true])); // all on for a new dataset
       // an uploaded dataset may not carry the previously-selected axis names
-      if (!m.axes.includes(field)) field = m.axes[0];
+      // ("" is the valid no-encoding choice, so leave it alone)
+      if (field && !m.axes.includes(field)) field = m.axes[0];
       if (!m.axes.includes(newAxis)) newAxis = m.axes[0];
       loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
       const r = await getFlexibility([]);
@@ -522,42 +531,55 @@
       error = (e as Error).message;
     }
   }
-  onMount(reloadAll);
-
-  // ---- dataset upload / reset ----
-  let polyFiles = $state<FileList | null>(null);
-  let sampFiles = $state<FileList | null>(null);
-  let uploadBusy = $state(false);
-  let uploadMsg = $state<string | null>(null);
-  let uploadErr = $state(false);
-
-  async function doUpload() {
-    const p = polyFiles?.[0], s = sampFiles?.[0];
-    if (!p || !s) return;
-    uploadBusy = true; uploadMsg = null; uploadErr = false;
-    try {
-      const r = await uploadDataset(p, s);
-      await reloadAll();
-      uploadMsg = `loaded ${r.n_samples.toLocaleString()} designs`;
-    } catch (e) {
-      uploadMsg = (e as Error).message; uploadErr = true;
-    } finally {
-      uploadBusy = false;
-    }
+  // Landing gate: the tool boots only after the landing page has built a dataset
+  // (generated its samples + precomputed views). `onready` hands us the fresh meta;
+  // reloadAll() then fetches the (now cache-warm) views. "change dataset" flips this
+  // back to false to return to the landing page.
+  let started = $state(false);
+  function onLandingReady(m: Meta) {
+    meta = m;
+    started = true;
+    reloadAll();
   }
-  async function doReset() {
-    uploadBusy = true; uploadMsg = null; uploadErr = false;
-    try {
-      await resetDataset();
-      polyFiles = null; sampFiles = null;
-      await reloadAll();
-      uploadMsg = "restored default";
-    } catch (e) {
-      uploadMsg = (e as Error).message; uploadErr = true;
-    } finally {
-      uploadBusy = false;
-    }
+
+  // ---- settings ----
+  let showSettings = $state(false);
+  // per-dimension on/off (keyed by axis name; missing/true = enabled). Disabled
+  // dimensions are hidden from Profiles, Coupling, Facets, and the color/slice
+  // pickers. The Map (PCA) projection always uses all technologies.
+  let dimEnabled = $state<Record<string, boolean>>({});
+  let reduceMotion = $state(false);
+  let clusterK = $state(6);
+  const activeAxes = $derived((meta?.axes ?? []).filter((a) => dimEnabled[a] !== false));
+  const nActive = $derived(activeAxes.length);
+  function toggleDim(a: string) {
+    // keep at least 2 dimensions on (pairwise views need a pair)
+    if (dimEnabled[a] !== false && nActive <= 2) return;
+    dimEnabled = { ...dimEnabled, [a]: dimEnabled[a] === false };
   }
+  function setAllDims(on: boolean) {
+    dimEnabled = Object.fromEntries((meta?.axes ?? []).map((a) => [a, on]));
+  }
+  // If the color/slice axis gets disabled, fall back gracefully.
+  $effect(() => {
+    if (field && dimEnabled[field] === false) { field = ""; loadColor(); }
+    if (sliceAxis && dimEnabled[sliceAxis] === false) exitSlice();
+  });
+  // Coupling view honours the toggles: subset the dependence matrices + shadow-pair
+  // list to the active axes only (the DependenceMatrix seriates whatever it's given).
+  const depView = $derived.by(() => {
+    const dp = depData;
+    if (!dp) return null;
+    if (activeAxes.length === dp.axes.length) return dp; // all on → pass through
+    const idx = dp.axes.map((a, i) => (dimEnabled[a] !== false ? i : -1)).filter((i) => i >= 0);
+    const sub = (M: number[][]) => idx.map((i) => idx.map((j) => M[i][j]));
+    return {
+      ...dp,
+      axes: idx.map((i) => dp.axes[i]),
+      dcor: sub(dp.dcor), mi: sub(dp.mi), pearson: sub(dp.pearson),
+    };
+  });
+  const pairsView = $derived(shadowPairs.filter((p) => dimEnabled[p.x] !== false && dimEnabled[p.y] !== false));
 
   // ---- axis captions ----
   function topTechs(comp: number[], names: string[], k = 2): string {
@@ -784,20 +806,19 @@
     return couplingSeriation(D);
   });
   function reorder<T>(arr: T[], ord: number[]): T[] { return ord.map((i) => arr[i]); }
-  // Reordered copies of ONLY the parallel-coords props (keeps dispFields/dispValues
-  // and every other consumer in canonical order). flexRanges match by axis name, so
-  // they need no reordering.
-  const pcFields = $derived(axisOrder.length ? reorder(dispFields, axisOrder) : dispFields);
-  const pcValues = $derived.by(() =>
-    axisOrder.length ? dispValues.map((row) => reorder(row, axisOrder)) : dispValues);
-  const pcOverlayOrd = $derived(
-    axisOrder.length && pcOverlay ? reorder(pcOverlay, axisOrder) : pcOverlay);
-  const pcStaticOrd = $derived(
-    axisOrder.length
-      ? pcStatic.map((s) => ({ values: reorder(s.values, axisOrder), color: s.color }))
-      : pcStatic);
-  const pcDomainExtraOrd = $derived(
-    axisOrder.length ? pcDomainExtra.map((row) => reorder(row, axisOrder)) : pcDomainExtra);
+  // Column order+filter for ONLY the parallel-coords props: the coupling seriation
+  // (or canonical identity) with settings-disabled dimensions dropped. dispFields/
+  // dispValues and every other consumer stay canonical & full-width (they index
+  // columns by axis name and rows by design id). flexRanges match by axis name.
+  const pcCols = $derived.by(() => {
+    const base = axisOrder.length ? axisOrder : dispFields.map((_, i) => i);
+    return base.filter((i) => dimEnabled[dispFields[i]] !== false);
+  });
+  const pcFields = $derived(reorder(dispFields, pcCols));
+  const pcValues = $derived.by(() => dispValues.map((row) => reorder(row, pcCols)));
+  const pcOverlayOrd = $derived(pcOverlay ? reorder(pcOverlay, pcCols) : pcOverlay);
+  const pcStaticOrd = $derived(pcStatic.map((s) => ({ values: reorder(s.values, pcCols), color: s.color })));
+  const pcDomainExtraOrd = $derived(pcDomainExtra.map((row) => reorder(row, pcCols)));
 
   // ---- hover tooltip ----
   // hoverIdx is the position within the rendered arrays; dispValues / dispPoints
@@ -910,10 +931,18 @@
   });
 </script>
 
+{#if !started}
+  <Landing onready={onLandingReady} />
+{:else}
 <div class="stage" role="presentation" onmousemove={onMove}>
   <!-- top bar -->
   <header class="hud panel topbar">
-    <h1>Energy Explorer <small>near-optimal energy-system designs</small></h1>
+    <div class="brand">
+      <h1>Energy Explorer <small>near-optimal energy-system designs</small></h1>
+      <button class="change-ds" title="pick or upload another dataset" onclick={() => (started = false)}>⟳ change dataset</button>
+      <button class="change-ds" class:on={showSettings} title="settings"
+              aria-label="settings" onclick={() => (showSettings = !showSettings)}>⚙ settings</button>
+    </div>
     <div class="seg view-seg">
       <button class:active={viewMode === "coupling"} onclick={() => (viewMode = "coupling")}>Coupling</button>
       <button class:active={viewMode === "profiles"} onclick={() => (viewMode = "profiles")}>Profiles</button>
@@ -935,16 +964,86 @@
     {/if}
   </header>
 
+  {#if showSettings}
+    <div class="settings-pop hud panel">
+      <div class="settings-head">
+        <span>Settings</span>
+        <button class="cpl-close" aria-label="close settings" onclick={() => (showSettings = false)}>✕</button>
+      </div>
+
+      <div class="set-sect">
+        <div class="set-label">
+          <span>Dimensions</span>
+          <span class="set-actions">
+            <button class="link" onclick={() => setAllDims(true)} disabled={nActive === (meta?.axes.length ?? 0)}>all on</button>
+          </span>
+        </div>
+        {#each meta?.axes ?? [] as a}
+          <label class="check dim">
+            <input type="checkbox" checked={dimEnabled[a] !== false}
+                   disabled={dimEnabled[a] !== false && nActive <= 2}
+                   onchange={() => toggleDim(a)} />
+            {short(a)}
+          </label>
+        {/each}
+        <span class="muted small">{nActive} of {meta?.axes.length ?? 0} on · shown in Profiles, Coupling & Facets. The Map (PCA) always uses all technologies.</span>
+      </div>
+
+      <div class="set-sect">
+        <div class="set-label"><span>Map clusters</span></div>
+        <label class="range-row">
+          <input type="range" min="2" max="12" step="1" bind:value={clusterK} onchange={loadClusters} />
+          <span class="range-val">{clusterK}</span>
+        </label>
+        <span class="muted small">number of k-means groups labelled on the Map.</span>
+      </div>
+
+      <div class="set-sect">
+        <label class="check"><input type="checkbox" bind:checked={reduceMotion} /> Reduce motion</label>
+        <span class="muted small">disable the facet slide-in and other animations.</span>
+      </div>
+    </div>
+  {/if}
+
   <!-- borderless graph between the panels -->
   {#if viewMode === "coupling"}
-    <div class="graph-region">
-      <DependenceMatrix
-        dep={depData}
-        pairs={shadowPairs}
-        metric={depMetric}
-        onmetric={(m) => (depMetric = m)}
-        onpair={(x, y) => { facetSel = { x, y }; viewMode = "facets"; }}
-      />
+    <div class="graph-region coupling-split" class:split={couplingPair}>
+      <div class="cpl-matrix">
+        <DependenceMatrix
+          dep={depView}
+          pairs={pairsView}
+          metric={depMetric}
+          onmetric={(m) => (depMetric = m)}
+          onpair={(x, y) => { facetSel = { x, y }; couplingPair = { x, y }; }}
+        />
+      </div>
+      {#if couplingPair}
+        <div class="cpl-facet" transition:fly={{ x: 60, duration: reduceMotion ? 0 : 280, easing: cubicOut }}>
+          <div class="cpl-facet-head">
+            <span class="cpl-facet-title">exact facet · {short(couplingPair.x)} × {short(couplingPair.y)}</span>
+            <button class="cpl-close" title="close facet panel" aria-label="close facet panel"
+                    onclick={() => (couplingPair = null)}>✕</button>
+          </div>
+          {#if dispFields.length}
+            <div class="cpl-facet-body">
+              <FacetView
+                fields={dispFields}
+                values={dispValues}
+                activeFields={activeAxes}
+                colorValues={dispColorValues}
+                colorCategorical={dispCategorical}
+                colorMin={dispColorMin}
+                colorMax={dispColorMax}
+                constraints={allConstraints}
+                selected={candidates ? null : selected}
+                dependence={depView}
+                selectPair={facetSel}
+                onconsumepair={() => (facetSel = null)}
+              />
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
   {:else if viewMode === "facets"}
     <div class="graph-region">
@@ -952,19 +1051,20 @@
         <FacetView
           fields={dispFields}
           values={dispValues}
+          activeFields={activeAxes}
           colorValues={dispColorValues}
           colorCategorical={dispCategorical}
           colorMin={dispColorMin}
           colorMax={dispColorMax}
           constraints={allConstraints}
           selected={candidates ? null : selected}
-          dependence={depData}
+          dependence={depView}
           selectPair={facetSel}
           onconsumepair={() => (facetSel = null)}
         />
       {/if}
     </div>
-  {:else if viewMode === "map" && proj && colorData}
+  {:else if viewMode === "map" && proj}
     <div class="graph-region">
       <ScatterGL
         bind:this={scatter}
@@ -1053,7 +1153,8 @@
     {/if}
     <label>Color by
       <select bind:value={field} onchange={loadColor}>
-        {#each meta?.axes ?? [] as a}<option value={a}>{a}</option>{/each}
+        <option value="">— none —</option>
+        {#each activeAxes as a}<option value={a}>{a}</option>{/each}
       </select>
     </label>
 
@@ -1061,7 +1162,7 @@
     <label>Slice axis
       <select value={sliceAxis ?? ""} onchange={(e) => startSlice(e.currentTarget.value || null)}>
         <option value="">— off —</option>
-        {#each meta?.axes ?? [] as a}<option value={a}>{short(a)}</option>{/each}
+        {#each activeAxes as a}<option value={a}>{short(a)}</option>{/each}
       </select>
     </label>
     {#if sliceAxis && sliceRange}
@@ -1239,28 +1340,8 @@
 
     <div class="sect">Dataset</div>
     <div class="data-box">
-      <div class="data-name" title={meta?.dataset.name}>
-        <span class="data-tag" class:up={meta && !meta.dataset.is_default}>
-          {meta?.dataset.is_default ? "default" : "uploaded"}
-        </span>
-        {meta?.dataset.name ?? "—"}
-      </div>
-      <label class="data-file">polytope&nbsp;.npz
-        <input type="file" accept=".npz" bind:files={polyFiles} disabled={uploadBusy} />
-      </label>
-      <label class="data-file">samples&nbsp;.npz
-        <input type="file" accept=".npz" bind:files={sampFiles} disabled={uploadBusy} />
-      </label>
-      <div class="data-row">
-        <button onclick={doUpload} disabled={uploadBusy || !polyFiles?.length || !sampFiles?.length}>
-          {uploadBusy ? "loading…" : "Load dataset"}
-        </button>
-        {#if meta && !meta.dataset.is_default}
-          <button class="link" onclick={doReset} disabled={uploadBusy}>reset</button>
-        {/if}
-      </div>
-      {#if uploadMsg}<span class="data-msg" class:err={uploadErr}>{uploadMsg}</span>{/if}
-      <span class="muted small">upload a polytope + samples .npz pair (same schema as the shipped data)</span>
+      <div class="data-name" title={meta?.dataset.name}>{meta?.dataset.name ?? "—"}</div>
+      <span class="muted small">use “⟳ change dataset” (top bar) to pick or upload another polytope</span>
     </div>
   </aside>
 
@@ -1369,6 +1450,7 @@
     </section>
   {/if}
 </div>
+{/if}
 
 <style>
   .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
@@ -1396,12 +1478,66 @@
   }
   h1 { font-size: 18px; margin: 0; font-weight: 600; }
   h1 small { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .change-ds {
+    flex: none; font-size: 11px; padding: 3px 9px; border-radius: 7px; white-space: nowrap;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--muted); cursor: pointer;
+  }
+  .change-ds:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); border-color: var(--accent); }
+  .change-ds.on { border-color: var(--accent); color: var(--accent); }
+
+  /* settings popover, anchored under the top bar (left) */
+  .settings-pop {
+    top: 76px; left: 16px; width: 244px; z-index: 6;
+    display: flex; flex-direction: column; gap: 14px; padding: 14px 16px;
+    max-height: calc(100% - 96px); overflow-y: auto;
+  }
+  .settings-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 13px; color: var(--fg);
+  }
+  .set-sect { display: flex; flex-direction: column; gap: 6px;
+    border-top: 1px solid #2a3441; padding-top: 12px; }
+  .set-sect:first-of-type { border-top: none; padding-top: 0; }
+  .set-label { display: flex; align-items: center; justify-content: space-between;
+    font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .set-actions { display: flex; gap: 8px; }
+  .check.dim { text-transform: capitalize; }
+  .range-row { flex-direction: row; align-items: center; gap: 10px; }
+  .range-row input { flex: 1; accent-color: var(--accent); }
+  .range-val { font-size: 12px; color: var(--fg); min-width: 16px; text-align: right; }
   .topbar-hint { color: var(--muted); font-size: 12px; text-align: right; min-width: 0; line-height: 1.15; }
 
   .graph-region {
     position: absolute; z-index: 1;
     top: 80px; left: 252px; right: 16px; bottom: 232px;
   }
+  /* Coupling view: matrix alone by default; when a cell is clicked the facet
+     panel docks into the right half and the matrix keeps the left half. */
+  .coupling-split { display: flex; gap: 14px; min-height: 0; overflow: hidden; }
+  .coupling-split .cpl-matrix { flex: 1 1 100%; min-width: 0; min-height: 0; }
+  .coupling-split.split .cpl-matrix { flex: 1 1 50%; }
+  /* facet panel: a header row (title + close) above the FacetView, so the close
+     button never overlaps FacetView's own controls (e.g. the rank dropdown). */
+  .cpl-facet {
+    flex: 1 1 50%; min-width: 0; min-height: 0;
+    display: flex; flex-direction: column; gap: 6px;
+    border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 14px;
+  }
+  .cpl-facet-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .cpl-facet-title {
+    font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cpl-facet-body { flex: 1; min-height: 0; position: relative; }
+  .cpl-close {
+    flex: none; display: flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 6px; padding: 0; font-size: 12px; line-height: 1;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--muted); cursor: pointer;
+  }
+  .cpl-close:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); }
   .ylabel {
     position: absolute; left: 0; top: 50%;
     transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl;
@@ -1450,24 +1586,12 @@
   .slice-legend { color: #e879f9; }
   .slice-w { font-size: 11px; color: var(--muted); }
   .slice-w input { width: 100%; accent-color: #e879f9; }
-  /* dataset upload */
+  /* dataset readout */
   .data-box { display: flex; flex-direction: column; gap: 6px; }
   .data-name {
     font-size: 11px; color: var(--fg); line-height: 1.3;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .data-tag {
-    display: inline-block; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
-    padding: 1px 5px; border-radius: 4px; margin-right: 4px;
-    background: #2a3441; color: var(--muted);
-  }
-  .data-tag.up { background: rgba(45, 212, 191, 0.2); color: var(--accent); }
-  .data-file { font-size: 11px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
-  .data-file input { font-size: 11px; color: var(--fg); }
-  .data-row { display: flex; gap: 8px; align-items: center; }
-  .data-row button { flex: none; }
-  .data-msg { font-size: 11px; color: var(--accent); line-height: 1.3; }
-  .data-msg.err { color: #e64a3b; }
   /* consequences (§4) */
   .cons-vol {
     display: flex; flex-direction: column; gap: 1px;

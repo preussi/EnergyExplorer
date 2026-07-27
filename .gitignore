@@ -23,6 +23,9 @@ backend/.venv/
 /polytope.npz
 /polytope_samples.npz
 
+# Samples are generated from the polytope at build time — no samples file shipped.
+backend/data/polytope_samples_*.npz
+
 # Local Claude Code settings (machine-specific)
 .claude/settings.local.json
 

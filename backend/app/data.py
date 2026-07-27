@@ -22,6 +22,16 @@ COST_AXIS = "net_present_cost"
 # /api/samples a ~50MB payload. Cap to a seeded, deterministic subset (plenty for
 # projections, clustering, dependence and the marginal/conditional violins).
 MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "400000"))
+# We now generate the sample cloud ourselves from the polytope (uniform
+# hit-and-run) rather than loading a samples file. This is the default count used
+# when a caller doesn't specify one (e.g. the lazily-built file default).
+DEFAULT_N_SAMPLES = int(os.environ.get("DEFAULT_N_SAMPLES", "20000"))
+# Human-friendly labels for the preloaded polytope files (falls back to the stem).
+_FRIENDLY = {"polytope_13": "Swiss energy system (v13)"}
+
+
+def friendly_name(stem: str) -> str:
+    return _FRIENDLY.get(stem, stem)
 
 
 def _resolve(data_dir: Path, stem: str, exclude: str = "") -> Path:
@@ -75,14 +85,15 @@ def _keys(npz) -> set[str]:
 
 
 class Dataset:
-    """In-memory view of the two .npz files, in clean 9-D technology space.
-
-    Built from already-loaded npz mappings (``poly``, ``samp``) so the same code
-    serves both the file-based default and user-uploaded data. Use
-    :func:`validate_npz` to check an upload before constructing.
+    """In-memory view of a polytope in clean 9-D technology space, with a sample
+    cloud. Samples are generated from the polytope (uniform hit-and-run) unless a
+    ``samp`` mapping is passed (back-compat / tests). The same code serves the
+    file-based default and user-uploaded polytopes. Use :func:`validate_polytope`
+    to check an upload before constructing.
     """
 
-    def __init__(self, poly, samp, name: str = ""):
+    def __init__(self, poly, samp=None, name: str = "",
+                 n_samples: int | None = None, seed: int = 42):
         self.name = name
 
         names = [str(n) for n in poly["name_list"]]        # 10 (last = cost)
@@ -112,28 +123,48 @@ class Dataset:
         self.u_star = self.optimum_tech      # back-compat alias: this IS the optimum
         self.optimum_norm = (self.optimum_tech - self._offset) / self._scale  # (9,)
 
-        # ---- samples: single sampler, 9-D fmax-normalized technologies ----
-        samp_keys = _keys(samp)
-        S = np.asarray(samp["samples"], dtype=float)                # (N, 9) normalized
-        chain = (np.asarray(samp["chain_id"], dtype=int)
-                 if "chain_id" in samp_keys else np.zeros(len(S), dtype=int))
-        if len(S) > MAX_SAMPLES:
-            rng = np.random.default_rng(42)
-            sub = np.sort(rng.choice(len(S), MAX_SAMPLES, replace=False))
-            S, chain = S[sub], chain[sub]
+        # ---- samples: 9-D fmax-normalized technologies ----
+        # Preferred path: generate the cloud ourselves (uniform hit-and-run over
+        # the projected polytope), so no samples file is needed. A samp mapping is
+        # still accepted for back-compat / tests.
+        if samp is not None:
+            samp_keys = _keys(samp)
+            S = np.asarray(samp["samples"], dtype=float)            # (N, 9) normalized
+            chain = (np.asarray(samp["chain_id"], dtype=int)
+                     if "chain_id" in samp_keys else np.zeros(len(S), dtype=int))
+            if len(S) > MAX_SAMPLES:
+                rng = np.random.default_rng(42)
+                sub = np.sort(rng.choice(len(S), MAX_SAMPLES, replace=False))
+                S, chain = S[sub], chain[sub]
+            self._chain = chain
+            self._n_chains = (int(np.asarray(samp["n_chains"]))
+                              if "n_chains" in samp_keys else int(chain.max()) + 1)
+
+            def _diag(key: str) -> list:
+                return np.asarray(samp[key]).tolist() if key in samp_keys else []
+            self.diagnostics = {
+                "method": str(samp["method"]) if "method" in samp.files else "hit_and_run",
+                "rhat": _diag("rhat"),
+                "ess": _diag("ess_bulk"),
+            }
+        else:
+            # Uniform over {x : A x <= b} via hit-and-run from the Chebyshev center.
+            # Local import avoids a module-load cycle (generate imports nothing here).
+            from .generate import chebyshev_center, hit_and_run
+            n = int(n_samples if n_samples is not None else DEFAULT_N_SAMPLES)
+            x0, radius = chebyshev_center(self.A, self.b)
+            if x0 is None or radius <= 0:
+                raise ValueError("polytope has no interior; cannot generate samples")
+            S = hit_and_run(self.A, self.b, n, x0, seed=seed)
+            if len(S) == 0:
+                raise ValueError("sample generation produced no points")
+            self._chain = np.zeros(len(S), dtype=int)
+            self._n_chains = 1
+            # single generated chain — rhat/ess convergence stats aren't meaningful
+            self.diagnostics = {"method": "hit_and_run", "rhat": [], "ess": []}
+
         self._norm = S
         self._phys = S * self._scale + self._offset
-        self._chain = chain
-        self._n_chains = (int(np.asarray(samp["n_chains"]))
-                          if "n_chains" in samp_keys else int(self._chain.max()) + 1)
-
-        def _diag(key: str) -> list:
-            return np.asarray(samp[key]).tolist() if key in samp_keys else []
-        self.diagnostics = {
-            "method": str(samp["method"]) if "method" in samp.files else "hit_and_run",
-            "rhat": _diag("rhat"),
-            "ess": _diag("ess_bulk"),
-        }
 
     @property
     def n_samples(self) -> int:
@@ -155,24 +186,20 @@ class Dataset:
         return self._chain
 
 
-# ---- schema validation for uploaded files ------------------------------------
-# Keys the loader genuinely needs; the rest (X, c_star, epsilon, chain_id, rhat…)
-# are optional and default gracefully in Dataset.__init__.
+# ---- schema validation for uploaded polytopes --------------------------------
+# Keys the loader genuinely needs; the rest (X, c_star, epsilon…) are optional and
+# default gracefully in Dataset.__init__. Samples are generated, never uploaded.
 REQUIRED_POLY = ("name_list", "A", "b", "u_star", "z_star")
-REQUIRED_SAMP = ("samples",)
 
 
-def validate_npz(poly, samp) -> list[str]:
-    """Return a list of human-readable problems with an uploaded polytope/samples
-    pair; an empty list means it is safe to build a :class:`Dataset` from it."""
+def validate_polytope(poly) -> list[str]:
+    """Return a list of human-readable problems with an uploaded polytope; an empty
+    list means it is safe to build a :class:`Dataset` from it."""
     problems: list[str] = []
-    pk, sk = _keys(poly), _keys(samp)
+    pk = _keys(poly)
     for k in REQUIRED_POLY:
         if k not in pk:
             problems.append(f"polytope file is missing required key '{k}'")
-    for k in REQUIRED_SAMP:
-        if k not in sk:
-            problems.append(f"samples file is missing required key '{k}'")
     if problems:
         return problems  # can't inspect shapes safely until keys exist
 
@@ -189,9 +216,6 @@ def validate_npz(poly, samp) -> list[str]:
     if A.ndim == 2 and b.size != A.shape[0]:
         problems.append(f"b must have {A.shape[0]} entries (one per A row); got {b.size}")
 
-    S = np.asarray(samp["samples"])
-    if S.ndim != 2 or S.shape[1] != n_tech:
-        problems.append(f"samples must be 2-D with {n_tech} columns (one per technology); got shape {S.shape}")
     for key in ("u_star", "z_star"):
         v = np.asarray(poly[key]).ravel()
         if v.size != n_tech:
@@ -204,16 +228,33 @@ _DEFAULT: Dataset | None = None   # lazily-built file-based dataset
 _ACTIVE: Dataset | None = None    # uploaded override; None → use the default
 
 
+def list_polytopes() -> list[dict]:
+    """Preloaded polytope files available in ``DATA_DIR`` (samples files excluded),
+    each as ``{id, name, n_axes}`` for the landing-page picker."""
+    out: list[dict] = []
+    for p in sorted(DATA_DIR.glob("polytope*.npz")):
+        if "samples" in p.name:
+            continue
+        try:
+            npz = np.load(p, allow_pickle=True)
+            names = [str(n) for n in npz["name_list"]]
+            n_axes = len(names) - 1 if COST_AXIS in names else len(names)
+        except Exception:  # noqa: BLE001 — skip unreadable/invalid files
+            continue
+        out.append({"id": p.stem, "name": friendly_name(p.stem), "n_axes": int(n_axes)})
+    return out
+
+
 def load_default() -> Dataset:
-    """The file-based dataset resolved from ``DATA_DIR`` (built once, cached)."""
+    """The file-based dataset resolved from ``DATA_DIR`` (built once, cached).
+    Samples are generated from the polytope — no samples file is read."""
     global _DEFAULT
     if _DEFAULT is None:
         poly_path = _resolve(DATA_DIR, "polytope", exclude="samples")
-        samp_path = _resolve(DATA_DIR, "polytope_samples")
-        name = f"{poly_path.name} + {samp_path.name}"
-        print(f"[data] loading default {name}", flush=True)
+        name = friendly_name(poly_path.stem)
+        print(f"[data] loading default {poly_path.name} (+{DEFAULT_N_SAMPLES} generated samples)", flush=True)
         _DEFAULT = Dataset(np.load(poly_path, allow_pickle=True),
-                           np.load(samp_path, allow_pickle=True), name=name)
+                           name=name, n_samples=DEFAULT_N_SAMPLES)
     return _DEFAULT
 
 

@@ -13,6 +13,7 @@
   let {
     fields = [],
     values = [],
+    activeFields = [],
     colorValues = [],
     colorCategorical = false,
     colorMin = 0,
@@ -25,6 +26,7 @@
   }: {
     fields: string[];
     values: number[][]; // physical, all axes (sample rows)
+    activeFields?: string[];            // dimensions enabled in Settings ([] = all)
     colorValues?: number[];
     colorCategorical?: boolean;
     colorMin?: number;
@@ -35,6 +37,11 @@
     selectPair?: { x: string; y: string } | null;  // one-shot drill-down from the heatmap
     onconsumepair?: () => void;         // ask the parent to clear selectPair once applied
   } = $props();
+
+  // A pair is selectable only when both of its axes are enabled in Settings.
+  const activeSet = $derived(new Set(activeFields));
+  const pairActive = (p: { x: string; y: string }) =>
+    activeFields.length === 0 || (activeSet.has(p.x) && activeSet.has(p.y));
 
   const SHORT: Record<string, string> = {
     photovoltaics: "PV", wind_offshore: "wind-off", wind_onshore: "wind-on",
@@ -55,7 +62,7 @@
   // dependence matrix is available, by |dCor|/|MI|/|Pearson| descending (strongest
   // coupling first). Same geometric small-multiples, different ordering lens.
   const rankedPairs = $derived.by(() => {
-    const ps = pairs.slice();
+    const ps = pairs.filter(pairActive);
     if (rankMetric === "boxiness" || !dependence)
       return ps.sort((a, b) => (a.boxiness ?? 1) - (b.boxiness ?? 1));
     const m = rankMetric;
@@ -95,7 +102,7 @@
       .then((r) => {
         pairs = r.pairs;
         pairsLoading = false;
-        if (!sel && pairs.length) sel = { x: pairs[0].x, y: pairs[0].y };
+        if (!sel && rankedPairs.length) sel = { x: rankedPairs[0].x, y: rankedPairs[0].y };
       })
       .catch((e) => { err = (e as Error).message; pairsLoading = false; });
     const ro = new ResizeObserver(() => {
@@ -105,6 +112,16 @@
     });
     ro.observe(plotEl);
     return () => ro.disconnect();
+  });
+
+  // If the selected pair's axes get disabled in Settings (or none is chosen yet),
+  // fall back to the top still-active pair so the plot never shows a hidden axis.
+  // Converges in one step: once sel is an active pair the condition is false.
+  $effect(() => {
+    if (!pairs.length) return;
+    if ((sel && !pairActive(sel)) || (!sel && rankedPairs.length)) {
+      sel = rankedPairs.length ? { x: rankedPairs[0].x, y: rankedPairs[0].y } : null;
+    }
   });
 
   // load the base (cached) shadow for the selected pair. Responses carry their
@@ -166,8 +183,19 @@
   });
   // snap numerical −0 / floating-point dust (e.g. LP min = −1e−12) to a clean 0
   const tickFmt = (v: number, span: number) => fmt(Math.abs(v) < 1e-6 * (span || 1) ? 0 : v);
-  const sx = $derived(domain ? scaleLinear().domain(domain.x).range([M.left, W - M.right]) : null);
-  const sy = $derived(domain ? scaleLinear().domain(domain.y).range([H - M.bottom, M.top]) : null);
+  // Square plotting box: both axes get the same pixel length, so the shadow's
+  // shape isn't stretched by the panel's aspect ratio. Largest square that fits
+  // inside the margins, centered in whatever space is left over.
+  const geo = $derived.by(() => {
+    const innerW = Math.max(0, W - M.left - M.right);
+    const innerH = Math.max(0, H - M.top - M.bottom);
+    const S = Math.min(innerW, innerH);
+    const x0 = M.left + (innerW - S) / 2;
+    const y1 = M.top + (innerH - S) / 2;      // top edge
+    return { S, x0, x1: x0 + S, y1, y0: y1 + S };
+  });
+  const sx = $derived(domain && geo.S > 0 ? scaleLinear().domain(domain.x).range([geo.x0, geo.x1]) : null);
+  const sy = $derived(domain && geo.S > 0 ? scaleLinear().domain(domain.y).range([geo.y0, geo.y1]) : null);
 
   function polyPath(poly: number[][]): string {
     if (!sx || !sy || !poly.length) return "";
@@ -245,14 +273,17 @@
           <!-- axis ticks: the true feasible min/max (LP extent), placed at the
                polygon edges — matches the violin axes below -->
           {#if extent}
-            <text x={sx(extent.x[0])} y={H - M.bottom + 16} class="tick">{tickFmt(extent.x[0], extent.x[1] - extent.x[0])}</text>
-            <text x={sx(extent.x[1])} y={H - M.bottom + 16} class="tick end">{tickFmt(extent.x[1], extent.x[1] - extent.x[0])}</text>
-            <text x={M.left - 6} y={sy(extent.y[0])} class="tick end">{tickFmt(extent.y[0], extent.y[1] - extent.y[0])}</text>
-            <text x={M.left - 6} y={sy(extent.y[1]) + 8} class="tick end">{tickFmt(extent.y[1], extent.y[1] - extent.y[0])}</text>
+            <text x={sx(extent.x[0])} y={geo.y0 + 16} class="tick">{tickFmt(extent.x[0], extent.x[1] - extent.x[0])}</text>
+            <text x={sx(extent.x[1])} y={geo.y0 + 16} class="tick end">{tickFmt(extent.x[1], extent.x[1] - extent.x[0])}</text>
+            <text x={geo.x0 - 6} y={sy(extent.y[0])} class="tick end">{tickFmt(extent.y[0], extent.y[1] - extent.y[0])}</text>
+            <text x={geo.x0 - 6} y={sy(extent.y[1]) + 8} class="tick end">{tickFmt(extent.y[1], extent.y[1] - extent.y[0])}</text>
           {/if}
+          <!-- axis titles, aligned to the square box -->
+          <text class="axis-lbl" x={(geo.x0 + geo.x1) / 2} y={geo.y0 + 30} text-anchor="middle">{short(baseShadow.x)} →</text>
+          <text class="axis-lbl"
+                transform="rotate(-90 {geo.x0 - 42} {(geo.y0 + geo.y1) / 2})"
+                x={geo.x0 - 42} y={(geo.y0 + geo.y1) / 2} text-anchor="middle">{short(baseShadow.y)} →</text>
         </svg>
-        <div class="axis-x">{short(baseShadow.x)} →</div>
-        <div class="axis-y">{short(baseShadow.y)} →</div>
         {#if consShadow && !consShadow.feasible}
           <div class="empty-note">⚠ constraints make this region empty</div>
         {/if}
@@ -324,15 +355,7 @@
   .opt { fill: #fff; stroke: rgba(0, 0, 0, 0.7); stroke-width: 1.5; }
   .tick { fill: var(--muted); font-size: 10px; }
   .tick.end { text-anchor: end; }
-  .axis-x {
-    position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
-    font-size: 12px; color: var(--accent);
-  }
-  .axis-y {
-    position: absolute; left: 6px; top: 50%;
-    transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl;
-    font-size: 12px; color: var(--accent);
-  }
+  .axis-lbl { fill: var(--accent); font-size: 12px; }
   .empty-note {
     position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
     color: #f0a14e; font-size: 12px; background: rgba(10, 14, 20, 0.8);

@@ -4,18 +4,20 @@ from __future__ import annotations
 import io
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .data import (
+    DATA_DIR,
     SPACES,
     Dataset,
+    friendly_name,
     get_dataset,
     is_default,
-    reset_active,
+    list_polytopes,
     set_active,
-    validate_npz,
+    validate_polytope,
 )
 from .generate import dependence as run_dependence
 from .generate import reset_caches
@@ -44,9 +46,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/meta")
-def meta():
-    ds = get_dataset()
+def _meta_dict(ds) -> dict:
     return {
         "axes": ds.axes,
         "methods": list(METHODS),
@@ -62,6 +62,11 @@ def meta():
     }
 
 
+@app.get("/api/meta")
+def meta():
+    return _meta_dict(get_dataset())
+
+
 def _load_npz_upload(file: UploadFile, kind: str):
     """Read an uploaded .npz into memory, or raise a 400 with a clear message."""
     if not file.filename or not file.filename.lower().endswith(".npz"):
@@ -72,41 +77,72 @@ def _load_npz_upload(file: UploadFile, kind: str):
         raise HTTPException(status_code=400, detail=f"could not read {kind} .npz: {e}")
 
 
-@app.post("/api/upload")
-def upload(polytope: UploadFile = File(...), samples: UploadFile = File(...)):
-    """Replace the active dataset with an uploaded polytope + samples pair (same
-    schema as the shipped data). Validated before swap; on success all
-    polytope-derived caches are cleared so every view recomputes on the new data."""
-    poly = _load_npz_upload(polytope, "polytope")
-    samp = _load_npz_upload(samples, "samples")
+# Bounds on the user-requested sample count (mirrored on the landing-page UI).
+N_MIN, N_MAX = 1000, 100000
 
-    problems = validate_npz(poly, samp)
-    if problems:
-        raise HTTPException(status_code=422, detail={"errors": problems})
 
-    name = f"{polytope.filename} + {samples.filename}"
-    try:
-        ds = Dataset(poly, samp, name=name)
-    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
-        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
+def _clamp_n(n: int) -> int:
+    if not (N_MIN <= int(n) <= N_MAX):
+        raise HTTPException(status_code=422,
+                            detail=f"n_samples must be between {N_MIN} and {N_MAX}")
+    return int(n)
 
+
+def _activate_and_warm(ds: Dataset) -> dict:
+    """Make ds the active dataset, clear stale caches, then eagerly precompute the
+    heavy views (dependence, facet shadows, extremes, base flexibility) so the UI
+    opens instantly. Returns the meta payload."""
     set_active(ds)
     reset_caches()
-    return {
-        "ok": True,
-        "dataset": {"name": ds.name, "is_default": False},
-        "axes": ds.axes,
-        "n_samples": ds.n_samples,
-    }
+    run_dependence(ds, "chrrt")
+    run_shadow_pairs(ds)       # also fills the per-pair shadow cache
+    run_extremes(ds, "chrrt")
+    run_flexibility(ds, [])
+    return _meta_dict(ds)
 
 
-@app.post("/api/reset")
-def reset():
-    """Discard any uploaded dataset and restore the shipped default."""
-    reset_active()
-    reset_caches()
-    ds = get_dataset()
-    return {"ok": True, "dataset": {"name": ds.name, "is_default": True}}
+@app.get("/api/datasets")
+def datasets():
+    """Preloaded polytopes available to build from (landing-page picker)."""
+    return {"datasets": list_polytopes()}
+
+
+class BuildPreloadedRequest(BaseModel):
+    dataset_id: str
+    n_samples: int = 20000
+
+
+@app.post("/api/build/preloaded")
+def build_preloaded(req: BuildPreloadedRequest):
+    """Build the active dataset from a preloaded polytope: generate `n_samples`
+    hit-and-run samples over it, then precompute every view."""
+    n = _clamp_n(req.n_samples)
+    stem = req.dataset_id
+    path = DATA_DIR / f"{stem}.npz"
+    if "/" in stem or ".." in stem or not path.exists():
+        raise HTTPException(status_code=404, detail=f"unknown dataset {stem!r}")
+    poly = np.load(path, allow_pickle=True)
+    try:
+        ds = Dataset(poly, name=friendly_name(stem), n_samples=n)
+    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
+        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
+    return _activate_and_warm(ds)
+
+
+@app.post("/api/build/upload")
+def build_upload(polytope: UploadFile = File(...), n_samples: int = Form(20000)):
+    """Build the active dataset from an uploaded polytope .npz (technologies +
+    cost, same schema as the shipped polytope), generating `n_samples` samples."""
+    n = _clamp_n(n_samples)
+    poly = _load_npz_upload(polytope, "polytope")
+    problems = validate_polytope(poly)
+    if problems:
+        raise HTTPException(status_code=422, detail={"errors": problems})
+    try:
+        ds = Dataset(poly, name=polytope.filename or "uploaded polytope", n_samples=n)
+    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
+        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
+    return _activate_and_warm(ds)
 
 
 @app.get("/api/projection")

@@ -8,7 +8,8 @@
   // triangles for two different reads of the same pair: the lower-left holds the
   // dependence value (color + number), the upper-right holds the exact 2-D facet
   // outline (LP shadow) — statistical coupling on one side, geometric shape on the
-  // other. Click a cell to open that pair as an exact Facet. The lower plot
+  // other. Axes are seriated by coupling value (strongly-coupled ones adjacent),
+  // so the matrix reads sorted. Click a cell to open that pair as an exact Facet. The lower plot
   // cross-checks the *statistical* dependence (dCor) against the *geometric* facet
   // structure (1 - boxiness): they should agree, which validates the sampler.
   let {
@@ -35,10 +36,41 @@
     dcor: "distance correlation", mi: "mutual information", pearson: "Pearson",
   };
 
-  const axes = $derived(dep?.axes ?? []);
-  const matrix = $derived<number[][]>(dep ? dep[metric] : []);
-  // dependence "strength" used for the color ramp (Pearson uses magnitude)
+  const rawAxes = $derived(dep?.axes ?? []);
+  const rawMatrix = $derived<number[][]>(dep ? dep[metric] : []);
+  // dependence "strength" used for the color ramp / ordering (Pearson uses magnitude)
   const strength = (v: number) => (metric === "pearson" ? Math.abs(v) : v);
+
+  // ---- coupling seriation: order axes so strongly-coupled ones sit adjacent ----
+  // Greedy chain: seed with the strongest-coupled pair, then repeatedly attach the
+  // unused axis most coupled to either end. Keyed on the currently-shown metric, so
+  // the matrix always reads sorted by the coupling value you're looking at.
+  function seriation(D: number[][]): number[] {
+    const n = D.length;
+    if (n < 2) return Array.from({ length: n }, (_, i) => i);
+    let bi = 0, bj = 1, best = -Infinity;
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++)
+        if (D[i][j] > best) { best = D[i][j]; bi = i; bj = j; }
+    const order = [bi, bj];
+    const used = new Set(order);
+    while (order.length < n) {
+      const head = order[0], tail = order[order.length - 1];
+      let node = -1, sim = -Infinity, atHead = false;
+      for (let k = 0; k < n; k++) {
+        if (used.has(k)) continue;
+        if (D[tail][k] > sim) { sim = D[tail][k]; node = k; atHead = false; }
+        if (D[head][k] > sim) { sim = D[head][k]; node = k; atHead = true; }
+      }
+      if (node < 0) break;
+      used.add(node);
+      if (atHead) order.unshift(node); else order.push(node);
+    }
+    return order;
+  }
+  const order = $derived.by(() => seriation(rawMatrix.map((row) => row.map(strength))));
+  const axes = $derived(order.map((i) => rawAxes[i]));
+  const matrix = $derived.by(() => order.map((i) => order.map((j) => rawMatrix[i][j])));
   const scaleMax = $derived.by(() => {
     let m = 0;
     for (let i = 0; i < matrix.length; i++)
@@ -90,11 +122,12 @@
   const valPts = $derived.by(() => {
     if (!dep) return [] as { dcor: number; interest: number; x: string; y: string }[];
     const out: { dcor: number; interest: number; x: string; y: string }[] = [];
-    for (let i = 0; i < axes.length; i++)
-      for (let j = i + 1; j < axes.length; j++) {
-        const b = boxMap.get(`${axes[i]}|${axes[j]}`) ?? boxMap.get(`${axes[j]}|${axes[i]}`);
+    // uses rawAxes/dep.dcor (canonical order) — the scatter is order-independent
+    for (let i = 0; i < rawAxes.length; i++)
+      for (let j = i + 1; j < rawAxes.length; j++) {
+        const b = boxMap.get(`${rawAxes[i]}|${rawAxes[j]}`) ?? boxMap.get(`${rawAxes[j]}|${rawAxes[i]}`);
         if (b == null) continue;
-        out.push({ dcor: dep.dcor[i][j], interest: 1 - b, x: axes[i], y: axes[j] });
+        out.push({ dcor: dep.dcor[i][j], interest: 1 - b, x: rawAxes[i], y: rawAxes[j] });
       }
     return out;
   });
@@ -156,7 +189,7 @@
           <strong>{short(axes[hover.i])} × {short(axes[hover.j])}</strong> ·
           {LABELS[metric]} = {matrix[hover.i][hover.j].toFixed(3)} · click → open facet
         {:else}
-          lower-left = dependence value · upper-right = exact 2-D facet outline · click any cell to open it · n = {dep.n} samples
+          sorted by coupling · lower-left = dependence value · upper-right = exact 2-D facet outline · click any cell to open it · n = {dep.n} samples
         {/if}
       </p>
     {:else}

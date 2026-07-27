@@ -95,20 +95,30 @@ async function postJSON<T>(url: string, body: unknown): Promise<T> {
 
 export const getMeta = () => getJSON<Meta>("/api/meta");
 
-export interface UploadResult {
-  ok: boolean;
-  dataset: DatasetInfo;
-  axes: string[];
-  n_samples: number;
+// ---- landing page: pick a preloaded polytope or upload one, then build ----
+export interface PreloadedDataset {
+  id: string;
+  name: string;
+  n_axes: number;
 }
 
-// Multipart upload of a polytope + samples .npz pair (replaces the active dataset).
-// Surfaces the backend's per-key validation errors (422) as a single message.
-export async function uploadDataset(polytope: File, samples: File): Promise<UploadResult> {
+export function getDatasets(): Promise<{ datasets: PreloadedDataset[] }> {
+  return getJSON<{ datasets: PreloadedDataset[] }>("/api/datasets");
+}
+
+// Build the active dataset from a preloaded polytope: the backend generates
+// `nSamples` samples over it and precomputes every view, then returns meta.
+export function buildPreloaded(datasetId: string, nSamples: number): Promise<Meta> {
+  return postJSON<Meta>("/api/build/preloaded", { dataset_id: datasetId, n_samples: nSamples });
+}
+
+// Same, from an uploaded polytope .npz. Surfaces the backend's per-key
+// validation errors (422) as a single joined message.
+export async function buildUpload(polytope: File, nSamples: number): Promise<Meta> {
   const fd = new FormData();
   fd.append("polytope", polytope);
-  fd.append("samples", samples);
-  const res = await fetchRetry("/api/upload", { method: "POST", body: fd });
+  fd.append("n_samples", String(nSamples));
+  const res = await fetchRetry("/api/build/upload", { method: "POST", body: fd });
   if (!res.ok) {
     const b = await res.json().catch(() => ({}));
     const d = (b as { detail?: unknown }).detail;
@@ -121,10 +131,6 @@ export async function uploadDataset(polytope: File, samples: File): Promise<Uplo
     throw new Error(msg);
   }
   return res.json();
-}
-
-export function resetDataset(): Promise<{ ok: boolean; dataset: DatasetInfo }> {
-  return postJSON<{ ok: boolean; dataset: DatasetInfo }>("/api/reset", {});
 }
 
 export function getProjection(

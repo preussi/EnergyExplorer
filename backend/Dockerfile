@@ -7,8 +7,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Bake the read-only sample data into the image so the container is
-# self-contained on Kubernetes (no data volume to provision).
+# Bake the (small ~46 KB) polytope into the image so the container is
+# self-contained on Kubernetes (no data volume). Samples are generated from the
+# polytope on demand — no large samples file is shipped.
 COPY data ./data
 
 ENV DATA_DIR=/app/data
