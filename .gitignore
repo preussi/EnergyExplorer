@@ -11,6 +11,9 @@ frontend/dist/
 # Projection cache (removed — PCA is live, t-SNE/UMAP dropped)
 backend/cache/
 
+# Per-user dataset sessions (runtime state: recipes + uploaded polytopes)
+backend/sessions/
+
 # Python venv (local backend testing only)
 backend/.venv/
 

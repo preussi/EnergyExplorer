@@ -10,19 +10,21 @@ how each visualization is computed, and how the pieces interact.
 ## Contents
 
 1. [System architecture](#1-system-architecture)
-2. [Data provenance — where the 20,000 solutions come from](#2-data-provenance)
+2. [Data provenance — where the polytope comes from](#2-data-provenance)
 3. [The near-optimal polytope](#3-the-near-optimal-polytope)
-4. [Uniform sampling — how hit-and-run works](#4-uniform-sampling--hit-and-run)
+4. [Uniform sampling — how hit-and-run works (now the app's own cloud)](#4-uniform-sampling--hit-and-run)
 5. [Normalized vs physical space](#5-normalized-vs-physical-space)
-6. [Projections (PCA / t-SNE / UMAP)](#6-projections)
+6. [Projections (PCA)](#6-projections)
 7. [Cluster labels](#7-cluster-labels)
 8. [Candidate generation (steering)](#8-candidate-generation-steering)
 9. [Extreme designs (MGA alternatives)](#9-extreme-designs)
-10. [Visual analytics overlays](#10-visual-analytics-overlays)
+10. [Visual analytics overlays](#10-visual-analytics-overlays) (incl. 10.13 settings & dimension toggles)
 11. [Interaction model](#11-interaction-model)
 12. [Color pipeline](#12-color-pipeline)
 13. [API reference](#13-api-reference)
 14. [Development & deployment workflow](#14-development--deployment-workflow)
+15. [Landing page & dataset building](#15-landing-page--dataset-building)
+16. [Sessions: multi-tenancy & persistence](#16-sessions-multi-tenancy--persistence)
 
 ---
 
@@ -40,23 +42,26 @@ Two Docker containers (a third, Postgres, is planned for persistence):
                │ /api/* (nginx proxy → backend:8000)
 ┌──────────────┴────────────────────────────────────────────┐
 │ backend (FastAPI + numpy + scikit-learn + scipy)            │
-│   loads .npz at startup · projections (PCA live, t-SNE/    │
-│   UMAP cached) · clusters · extremes (LP) · generation     │
-│   (LP feasibility + hit-and-run)                           │
+│   loads the polytope · GENERATES the sample cloud (hit-    │
+│   and-run) at build time · PCA live · clusters · extremes  │
+│   (LP) · shadows / flexibility / volume · generation       │
 └──────────────▲────────────────────────────────────────────┘
                │ read-only volume
-        data/polytope.npz · data/polytope_samples.npz
+              data/polytope.npz   (no samples file — generated)
 ```
 
-- The **frontend** never computes statistics on the 10-D data; it renders what
+- The **frontend** never computes statistics on the 9-D data; it renders what
   the backend serves and handles interaction (selection, brushing, pinning).
-- The **backend** holds everything in memory (the data is ~6 MB) and caches
-  expensive results (t-SNE/UMAP to disk, extremes in memory).
+- The **backend** holds each dataset in memory and caches expensive results
+  **on that dataset** (dependence, shadows, extremes, flexibility). A dataset
+  **build** (§15) generates the cloud and eagerly warms all of these so the first
+  view of every tab is instant. The only thing on disk is a few-KB **session
+  recipe** per built dataset (§16) — enough to regenerate it after a restart.
 
 ## 2. Data provenance
 
-The 20,000 solutions were produced **upstream** of this project by an
-energy-system MGA pipeline (provenance is stamped in
+The polytope was produced **upstream** of this project by an energy-system MGA
+pipeline (the reference sample set below was historically stamped in the now-dropped
 `polytope_samples.npz → config`):
 
 1. **Energy-system model** — ZEN-garden-family model, scenario
@@ -81,6 +86,13 @@ energy-system MGA pipeline (provenance is stamped in
 Every scatter point = one feasible 2050 European energy-system design within
 5 % of minimum cost.
 
+**What the app actually uses now (2026-07).** Only the **polytope** (`(A, b)` +
+`u_star`/`z_star`) is shipped and consumed; the upstream sample file was dropped.
+The app **generates its own uniform cloud** from the polytope with hit-and-run at
+build time (§4, §15), sized by the user on the landing page. Steps 4–5 above thus
+describe how the *reference* cloud was validated upstream, not what ships — the
+polytope provenance (steps 1–3) is what still matters.
+
 ## 3. The near-optimal polytope
 
 All constraints are linear, so the near-optimal set is a convex polytope
@@ -101,7 +113,8 @@ Two properties the app exploits:
 ## 4. Uniform sampling — hit-and-run
 
 Goal: sample **uniformly from inside P**. Grids and rejection sampling fail in
-10-D, so an MCMC random walk is used. One hit-and-run step from point `x`:
+9-D (cost is projected out at load, §1), so an MCMC random walk is used. One
+hit-and-run step from point `x`:
 
 1. **Direction** — draw `d ~ N(0, I)`, normalize to unit length.
 2. **Chord** — the line `x + t·d` stays inside P while every constraint holds.
@@ -123,9 +136,14 @@ Variants in the dataset:
 | thinning | 20 | 100 |
 | ESS (of 20k) | ~3,000–9,000 | ~20,000 |
 
-The app's own generator (`backend/app/generate.py`) implements the HAR variant
-in ~40 lines of numpy (burn-in 250, thinning 8) — sufficient for interactive
-candidate generation; `hopsy` remains the rigorous option for final results.
+The app's own generator (`backend/app/generate.py:hit_and_run`) implements the HAR
+variant in ~40 lines of numpy (burn-in 250, thinning 8). It now produces **the
+base sample cloud** too, not just steered candidates: `Dataset.__init__` calls it
+once at build time (§15) with the landing-page count (default 20k, 1k–100k),
+seeded 42. Because it's a **single chain**, `meta.diagnostics` R̂/ESS are empty —
+these samples are for interactive analytics, not a convergence-certified result;
+`hopsy` remains the rigorous option for final published numbers. Every downstream
+view (projection, dependence, violins, volume) reads this generated cloud.
 
 **Starting point / feasibility** — the **Chebyshev center**: the LP
 
@@ -162,14 +180,16 @@ lerping two designs in phys space equals lerping in norm space — the morph
 
 ## 6. Projections
 
-10-D → 2-D for the map view. Computed on **normalized technology axes only**
-(9-D; cost is excluded from the geometry and encoded as color).
+9-D → 2-D for the map view. Computed on **normalized technology axes only**
+(cost is excluded from the geometry and encoded as color).
 
 | method | runs | optimum placement | axis meaning |
 |---|---|---|---|
 | **PCA** | live (<100 ms) | exact (`transform`) | linear combos; loadings shown |
-| **t-SNE** | precomputed → `backend/cache/` | embedded jointly at build time | non-metric |
-| **UMAP** | precomputed → cache | embedded jointly | non-metric |
+| **STAR** | live, frontend | linear | user-placed axis anchors |
+
+t-SNE/UMAP were removed along with the projection cache — PCA is fast enough to
+run per request, so there is no build step and no HTTP 425 path.
 
 - **PCA** — eigendecomposition of the covariance; the app reports explained
   variance (PC1 ≈ 27.9 %, PC2 ≈ 16.1 %) and **loadings** (`components`), which
@@ -248,8 +268,8 @@ KDE contours (`d3-contour`, bandwidth 14, 10 thresholds) over the projected
 points, computed once per dataset in a fixed 512² virtual grid, rendered as SVG
 paths under a single affine `matrix(...)` transform (with
 `vector-effect: non-scaling-stroke`) so pan/zoom needs **no recompute**.
-*Reading it:* the samples are uniform in 10-D, so 2-D density = the polytope's
-**thickness along the 8 projected-out dimensions**. Ridges = mixes with many
+*Reading it:* the samples are uniform in 9-D, so 2-D density = the polytope's
+**thickness along the 7 projected-out dimensions**. Ridges = mixes with many
 distinct realizations (flexible regions); sparse fringes = tightly constrained
 corners.
 
@@ -294,29 +314,38 @@ the 9 technologies; the 250 nearest displayed designs become the linked
 selection (highlighted in both views). *Use:* "are there many designs like
 this one?" — a robustness probe.
 
-### 10.8 Facet views (exact 2-D shadows) — the "Facets" tab
-Why: a 2-D projection of this 10-D body is *supposed* to look like a filled
+### 10.8 Facet view (exact 2-D shadow) — opened from the Coupling matrix
+Why: a 2-D projection of this 9-D body is *supposed* to look like a filled
 blob — measured: the strongest tech-tech correlation is |r|=0.36, the PCA
 spectrum is nearly flat (28/16/12/11/11/8/6/5/2 %), and 23/172 constraints are
 plain per-tech bounds, so the body is a weakly-coupled, corner-trimmed box.
-The information lives in the **boundary**, so the Facets tab shows it exactly:
-- `GET /api/shadow_pairs` ranks all 45 axis pairs by **boxiness** = area(exact
-  shadow polygon) / area(its bounding box). Low boxiness = real trade-off facets
-  (best: CCS×biomass 0.56, CCS×cost 0.61, DAC×cost 0.62; worst: every
-  nuclear pair ≈ 1.0 — nuclear is decoupled from everything).
+The information lives in the **boundary**, so the facet view shows it exactly:
+- `GET /api/shadow_pairs` ranks all **36** axis pairs (C(9,2) — cost is projected
+  out, so there are no cost pairs) by **boxiness** = area(exact shadow polygon) /
+  area(its bounding box). Low boxiness = real trade-off facets (best:
+  CCS×biomass 0.56; worst: every nuclear pair ≈ 1.0 — nuclear is decoupled from
+  everything). This ranking no longer drives a picker — the Coupling matrix is the
+  only way to choose a pair — but it still supplies the fallback order when the
+  drawn pair's axes get disabled.
 - `POST /api/shadow {x, y, constraints}` computes the polygon by
   **support-function LPs**: for 72 directions θ, maximize cosθ·xᵢ + sinθ·xⱼ
   over `A·x ≤ b` (+ user constraint rows); the maximizers' convex hull is the
   exact orthogonal projection of the polytope. Unconstrained shadows are cached.
-- UI: ranked small multiples (top 10) → enlarged facet with the sample cloud,
-  the exact white boundary, the optimum, and — when constraints/brushes are
-  active — the **constrained polygon** in teal (debounced 300 ms).
+- UI: one facet at a time — the sample cloud, the exact white boundary, the
+  optimum, and — when constraints/brushes are active — the **constrained polygon**
+  in teal (debounced 300 ms).
 *Reading it:* samples thin out near the boundary because the body's thickness
 → 0 there — the boundary designs are feasible but have few variations.
 
+The facet is drawn in a **square plot box** (both axes get equal pixel length,
+centered in the panel) so the shadow's shape isn't stretched by the panel's aspect
+ratio, and a **⇄ swap axes** button transposes the pair in place. Disabled
+dimensions (§10.13) can't be drawn: the panel falls back to the top still-active
+pair.
+
 ### 10.9 Remaining-flexibility bars
-`POST /api/flexibility {constraints}` solves 2 LPs per axis (20 total, ~50 ms)
-for the **exact** remaining [min, max] of every technology + cost under the
+`POST /api/flexibility {constraints}` solves 2 LPs per axis (18 total, ~50 ms)
+for the **exact** remaining [min, max] of every technology under the
 user's constraints. The sidebar shows: full near-optimal range (track), the
 surviving range (teal band, animated), and the optimum (white tick). Unlike
 filtering the 20k samples (which goes sparse after 2–3 brushes), LP ranges are
@@ -358,7 +387,7 @@ The Facets tab measures coupling **geometrically** (boxiness of the exact LP
 shadow). The Coupling tab measures it **statistically** from the samples, which
 matters because the linear correlation is nearly useless here (max |Pearson|
 ≈ 0.39) while the real couplings are nonlinear (polytope facets/corners). Three
-pairwise measures over the 10 axes (`GET /api/dependence`, cached per sampler,
+pairwise measures over the 9 technology axes (`GET /api/dependence`, cached per sampler,
 computed on a 1,500-point subsample since distance correlation is O(n²)):
 - **Distance correlation** (default) — `dCor ∈ [0,1]`, **0 iff independent**,
   catches nonlinear/non-monotonic dependence. Computed from double-centered
@@ -371,11 +400,50 @@ computed on a 1,500-point subsample since distance correlation is O(n²)):
 - **Pearson** — the linear baseline, for contrast.
 
 All three are affine-invariant per axis, so normalized vs physical units give
-identical results. The heatmap cell click opens that pair as an exact Facet, and
-the Facets tab's ranking dropdown can re-sort the 45 pairs by any of these
-instead of boxiness. A companion scatter plots **dCor vs (1 − boxiness)** per
-pair: the up-right trend is a built-in cross-check that the sampled cloud's
-dependence matches the polytope's exact facet structure (a sampler sanity test).
+identical results. (An earlier build carried a companion **dCor vs (1 − boxiness)**
+scatter in the side rail as a sampler sanity check; it was dropped to keep the
+view to one idea. The same cross-check can be read pair-by-pair from the matrix
+itself — the lower-left value against the upper-right outline.)
+
+**Matrix layout (current).** Coupling is the **default tab**, and the only entry
+point to the facet view (§10.8) — there is no separate Facets tab. The matrix is
+symmetric, so rather than mirror the numbers the two triangles show two reads of
+each pair: the **lower-left** holds the dependence value (color + number), the
+**upper-right** holds that pair's **exact 2-D facet outline** (the LP shadow
+polygon, fetched per pair and scaled into the cell) — statistical coupling on one
+side, geometric shape on the other.
+
+**Axis order — clustered by proximity.** The axes are ordered by **hierarchical
+clustering** on the coupling values, the construction used by
+[Amumo](https://github.com/ginihumer/Amumo)'s "cluster matrix by similarity"
+(`utils.get_cluster_sorting`): agglomerative **complete linkage** over
+`1 − similarity`, then read the axes off the dendrogram. Mutually-coupled axes end
+up adjacent, so a coupled group reads as a bright block on the diagonal instead of
+scattered cells. Two differences from Amumo:
+- It cuts the tree with `fcluster(…, 10, "maxclust")` and sorts by cluster id.
+  With 9 axes that puts every axis in its own cluster and degenerates to the input
+  order, so we use the **leaf order**, which is what does the grouping.
+- A dendrogram leaves each subtree's flip free (2^(k−1) equally valid readings, very
+  visible at this size), so we take the flip set minimizing the summed distance
+  between neighbouring axes — **optimal leaf ordering**, by the DP that keeps only
+  the cheapest arrangement per (first, last) endpoint pair.
+
+Coupling is a *distance* here via `1 − v/max(v)`: MI is unbounded, so an absolute
+`1 − v` would not be comparable across metrics. The clustering is keyed to the
+metric on display and to the enabled axes, so switching dcor/MI/Pearson or toggling
+a dimension re-clusters. Verified against `scipy.cluster.hierarchy`: the merge
+sequence is identical, and the resulting order is within ~3 % of the best of all
+9! permutations (which need not respect the tree at all).
+
+**Coupling → Facet split.** Clicking any cell slides a **Facet panel in from the
+right** (docked split: matrix keeps the left half, facet the right), showing that
+pair's exact shadow. Its header carries **⛶ full view** — which hides the matrix
+so the facet fills the region, toggling back with ⛶ exit full view — and a close
+(✕). Re-clicking cells re-drills the open panel.
+
+Both the matrix and the split honour the dimension toggles (§10.13): the
+dependence matrices are subset to the enabled axes, and a docked facet whose axis
+gets disabled is closed rather than left captioning a hidden dimension.
 
 ### 10.12 Volume retained (how much of the space survives) — subset simulation
 The Consequences panel answers *"how much smaller does the near-optimal space get
@@ -421,6 +489,35 @@ order-of-magnitude, not two-sig-fig. The **exact** feasibility and per-lever LP
 ranges (§10.9) are unaffected — they hold at any constraint depth regardless of how
 many samples land.
 
+### 10.13 Settings panel & dimension toggles
+The **⚙ settings** popover (top bar) holds three controls:
+- **Dimensions on/off** — a checkbox per technology (minimum 2 stay on). Disabling
+  an axis removes it from the **parallel coords** strip and the **Coupling** matrix,
+  closes a docked facet drawn on it, and clears it from the color-by / slice pickers
+  (each resets gracefully).
+- **Map clusters (k)** — 2–12, the number of k-means region labels (§7).
+- **Reduce motion** — disables the facet slide-in and other animations.
+
+**Semantics — dropping a dimension is display-level *marginalization*, not model
+surgery.** Nothing is recomputed: the samples, the dependence matrices, and the
+facet shadows are all filtered/subset at the presentation layer only (the core
+`dispFields`/`dispValues` stay full-width, indexed by axis name). Consequences:
+- A point `(x, y, z)` with `z` disabled just isn't *drawn* on `z`; it keeps its
+  value and plots at `(x, y)`. Marginals are invariant — the `x` violin, dCor(x,y),
+  and the (x,y) facet are **identical** whether or not `z` is shown, because each
+  was already a marginal/projection over the full space.
+- The three views are **not** derivable from one another: violins are 1-D
+  marginals (no coupling info), dCor is a scalar coupling summary of the *sample
+  density*, the facet is the *geometric* feasible boundary. Related (uniform
+  sampling ties density to volume) but distinct — hence the dCor-vs-boxiness check.
+- Crucially, a dropped axis **still constrains the ones kept**: the (x,y) facet is
+  the projection of the full polytope, so it already integrates out `z`. Hiding
+  `z` ≠ *constraining* `z` (which would shrink the shadow) and ≠ *eliminating* `z`
+  (the Fourier–Motzkin removal of cost at load, §3, which genuinely drops a var).
+- **The Map (PCA) ignores the toggles** — PCA is a linear combination of all 9
+  technologies, so honouring a drop would require refitting on the subset (a
+  backend recompute we chose not to do); a note in the panel says so.
+
 ## 11. Interaction model
 
 - **Linked selection** — one row-index set drives both views: lasso (Select
@@ -441,28 +538,34 @@ One shared colormap module (`colors.ts`): a 64-step viridis-like ramp for
 continuous fields and a 6-color categorical palette (chains). The same encoding
 feeds the scatter (`pointColor` + `colorBy: valueA` with values normalized to
 [0,1]), the parallel-coordinate lines (canvas strokes, grouped by quantized
-color so 20k lines ≈ 64 stroke calls), and the legend. Color-by: cost (default),
-any technology (phys or norm units), or chain id.
+color so lines ≈ 64 stroke calls), and the legend. Color-by defaults to
+**— none —** (no encoding: uniform points/lines); pick any technology (phys units)
+to encode it. (Cost was dropped as an axis, so it is no longer a color option.)
 
 ## 13. API reference
 
+Every endpoint below reads **the dataset named by the request** — `X-Dataset-Id`
+header or `?ds=<session id>`, falling back to the shipped default when neither is
+present, and 404 when the id is unknown (§16).
+
 | endpoint | method | purpose |
 |---|---|---|
-| `/api/health` | GET | liveness |
+| `/api/health` | GET | liveness + session counts (resident / on disk / cap) |
 | `/api/meta` | GET | axes, samplers, methods, n, optimum (u\*, c\*, ε), R̂/ESS |
 | `/api/projection?method&sampler&dims[&sample]` | GET | 2-D points + index + optimum + (PCA) explained variance & loadings; 425 if an expensive method isn't cached |
 | `/api/color?sampler&field&space` | GET | per-point scalar (cost / technology / chain) + min/max + categorical flag |
-| `/api/samples?sampler&space&fields` | GET | raw per-design values (parallel coords, tooltips) |
+| `/api/samples?sampler&space&fields[&sample]` | GET | raw per-design values (parallel coords, tooltips) |
 | `/api/clusters?method&sampler&k` | GET | k-means region centroids + z-score characterization |
 | `/api/extremes?sampler` | GET | 18 LP extreme designs (values, cost, PCA coords) |
-| `/api/shadow_pairs` | GET | all 45 axis pairs ranked by shadow boxiness (cached) |
-| `/api/dependence?sampler` | GET | 10×10 distance-correlation, mutual-information & Pearson matrices (cached, 1.5k subsample) |
+| `/api/shadow_pairs` | GET | all 36 axis pairs ranked by shadow boxiness (cached) |
+| `/api/dependence?sampler` | GET | 9×9 distance-correlation, mutual-information & Pearson matrices (cached, 1.5k subsample) |
 | `/api/shadow` | POST | exact 2-D shadow polygon of the (constrained) polytope |
 | `/api/flexibility` | POST | exact remaining [min,max] per axis under constraints |
 | `/api/volume` | POST | relative volume of the constrained region vs the full space (subset-simulation estimate; accurate in the tail) |
 | `/api/generate` | POST | constraints → feasibility LP → hit-and-run candidates + PCA coords |
-| `/api/upload` | POST | multipart polytope + samples `.npz` → validated (schema-checked) and swapped in as the active dataset; clears all polytope-derived caches |
-| `/api/reset` | POST | discard an uploaded dataset and restore the shipped default |
+| `/api/datasets` | GET | preloaded polytopes available to build from (`{id, name, n_axes}`) |
+| `/api/build/preloaded` | POST | `{dataset_id, n_samples}` → build a dataset from a shipped polytope: generate the cloud + eagerly warm every cache; returns `/api/meta` **with the new session id** |
+| `/api/build/upload` | POST | multipart polytope-only `.npz` + `n_samples` form field → `validate_polytope`, build, warm; returns `/api/meta` with the new session id |
 
 ## 14. Development & deployment workflow
 
@@ -476,12 +579,18 @@ cd frontend && npm run dev           # Vite proxies /api → 127.0.0.1:8000
 
 # quality gates
 cd frontend && npm run check && npm run build
-
-# projection cache (t-SNE/UMAP; persisted via the ./backend/cache volume)
-docker compose exec backend python -m app.projections [--force]
 ```
 
+(No projection cache anymore — PCA is live, t-SNE/UMAP were removed. No samples
+file is shipped either; the cloud is generated per §4/§15.)
+
 Gotchas learned along the way:
+- **Module-global state made the backend single-tenant** — the "active dataset"
+  and every polytope-derived cache (shadows, dependence, extremes, base
+  flexibility) were module globals, so a second user's build silently replaced the
+  first user's data and served them its cached LPs. Both are now per request /
+  per dataset (§16). The rule: if it derives from the polytope, it belongs to the
+  dataset, not the module.
 - **Docker images are immutable** — source edits need `docker compose build
   <svc> && docker compose up -d <svc>`; "my changes vanished" usually means a
   stale image (check `docker compose ps` creation times).
@@ -493,10 +602,88 @@ Gotchas learned along the way:
 - **regl-scatterplot encoding** — color value goes in the **3rd** tuple slot
   (`valueA`), normalized to [0,1] for continuous data; `zDataType` set
   explicitly.
-- **20k points** — WebGL for the scatter; canvas (not SVG) for 20k polylines;
+- **Up to 100k generated points, ≤ 50k displayed** — WebGL for the scatter; canvas
+  (not SVG) for the polylines. `/api/projection` and `/api/samples` share one
+  seeded `sample=DISPLAY_N` subset so their rows stay positionally aligned;
   precompute/cache anything slower than ~100 ms.
 - **Debounce ≠ cancellation** — `clearTimeout` can't stop a fetch already in
   flight; every debounced fetch whose response writes state needs a sequence
   token (`const my = ++seq; … if (my !== seq) return;`) or a response-identity
   check (e.g. shadow responses carry their `x`/`y` pair), or out-of-order
   responses clobber newer state. Found by adversarial review in three places.
+
+## 15. Landing page & dataset building
+
+The app boots to a **landing page** (`frontend/src/lib/Landing.svelte`) rather than
+straight into the tool. It:
+
+1. Lists the preloaded polytopes (`GET /api/datasets`) as pickable cards, plus an
+   **upload-your-own-polytope** (`.npz`) card. (Only the polytope is needed — a
+   few tens of KB — because samples are generated, not uploaded.)
+2. Takes a **sample count** (slider + number, default 20k). The UI gates the range;
+   the API rejects anything outside 1k–100k with a 422 (it does not clamp).
+3. On **Generate & Explore**, calls `POST /api/build/preloaded` or
+   `/api/build/upload`. The backend generates the cloud (hit-and-run, §4) and
+   **eagerly precomputes** dependence, all shadow pairs, extremes, and base
+   flexibility, then returns `/api/meta`. Only then does `App.svelte` flip its
+   `started` gate and `reloadAll()` the tool — every view opens against warm
+   caches. A **⟳ change dataset** link in the top bar returns here.
+
+Timings (v13 polytope, ~219 rows): build + warm ≈ **5 s @ 20k**, ≈ **13 s @ 100k**
+(the eager `shadow_pairs` LPs dominate). The build is one synchronous request; the
+button shows a progress state and nginx keeps a long `proxy_read_timeout`.
+
+A build returns a **session id** alongside the meta; see §16.
+
+## 16. Sessions: multi-tenancy & persistence
+
+The backend used to hold one *active dataset* in a module global, with the LP /
+dependence caches keyed globally too. That is a single-tenant model with two
+visible failures: a second user's build replaces the first user's data (and hands
+them its cached LP results), and a page refresh drops everyone back to the landing
+page because nothing on the client remembers which dataset it was looking at.
+
+**A dataset is now a session.** `sessions.create` mints a short URL-safe id
+(`secrets.token_urlsafe(9)`) and every request names the dataset it wants:
+
+| transport | used by | why |
+|---|---|---|
+| `X-Dataset-Id` header | the frontend (set once in `api.ts`'s `fetchRetry`) | can't be dropped by a caller assembling a URL |
+| `?ds=<id>` query | shared links, curl, `/docs` | makes a dataset linkable |
+| *(absent)* | API explorers | falls back to the shipped default |
+
+Resolution is a FastAPI dependency (`current_dataset`); endpoints declare
+`ds: Dataset = Depends(current_dataset)` and never consult module state. An id the
+backend doesn't know is a **404**, which is the frontend's signal to forget it and
+show the landing page.
+
+### Persistence: store the recipe, not the cloud
+Hit-and-run is seeded, so `(polytope, n_samples, seed)` *is* the sample cloud.
+A session therefore persists as a recipe:
+
+```
+SESSION_DIR/<id>/session.json   {source, stem, n_samples, seed, name, created}
+SESSION_DIR/<id>/polytope.npz   uploads only (~46 KB — it exists nowhere else)
+```
+
+A few KB per session instead of the 1.4 MB (20k) – 7 MB (100k) a snapshot would
+cost, and a cold hit regenerates the *same* points (verified byte-identical across
+a container restart) for ~5 s @ 20k / ~13 s @ 100k.
+
+### Bounded memory
+A warm dataset is tens of MB once its LP caches fill, so only the `MAX_SESSIONS`
+(env, default 8) most-recently-used stay resident, LRU-evicted. Eviction is not
+loss: the id still resolves, it just pays a rebuild. A **per-id build lock** stops
+N concurrent requests from regenerating the same cloud N times after an eviction —
+verified with 48 concurrent requests across 4 sessions at cap 2, zero cross-talk.
+
+Every polytope-derived cache now hangs off `ds.cache` (`generate._slot`), so a
+fresh dataset starts cold and nothing ever needs invalidating (`reset_caches()` is
+gone). `SESSION_TTL_DAYS` (env, default 30) sweeps stale recipes at startup.
+
+### Frontend
+The id lives in `localStorage` **and** the URL (`?ds=`), the URL winning so a
+shared link opens the dataset it names. On boot `App.svelte` sets the id and tries
+`getMeta()`: success enters the tool directly (no landing flash — a `restoring`
+gate covers the round-trip), `UnknownDataset` (404) clears it and shows the
+landing page. "⟳ change dataset" clears both id and URL param.

@@ -95,22 +95,13 @@ def _constrained_system(ds, constraints):
     return A, b
 
 
-# (i, j) -> unconstrained shadow result (the polytope is static)
-_SHADOW_CACHE: dict[tuple[int, int], dict] = {}
-_SHADOW_PAIRS_CACHE: list | None = None
-_FLEX_BASE_CACHE: dict | None = None
-
-
-def reset_caches() -> None:
-    """Clear every polytope-derived cache. Call this whenever the active dataset
-    changes (upload / reset) — all caches assume a single static polytope and are
-    keyed globally, not per dataset."""
-    global _SHADOW_PAIRS_CACHE, _FLEX_BASE_CACHE
-    _SHADOW_CACHE.clear()
-    _SHADOW_PAIRS_CACHE = None
-    _FLEX_BASE_CACHE = None
-    _DEPENDENCE_CACHE.clear()
-    _EXTREMES_CACHE.clear()
+# Every cache below is keyed to *its* dataset (`ds.cache`), not to module state:
+# each user's session holds a different polytope, and a global cache would serve
+# one user's LP results to another. A fresh Dataset starts with empty caches, so
+# nothing ever needs invalidating.
+def _slot(ds, key: str, default):
+    """Get-or-create this dataset's cache bucket for `key`."""
+    return ds.cache.setdefault(key, default)
 
 
 def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
@@ -123,8 +114,9 @@ def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
     i, j = ds.axes.index(x_axis), ds.axes.index(y_axis)
     cons = constraints or []
     key = (i, j) if not cons else None
-    if key is not None and key in _SHADOW_CACHE:
-        return _SHADOW_CACHE[key]
+    shadows = _slot(ds, "shadow", {})   # (i, j) -> unconstrained shadow result
+    if key is not None and key in shadows:
+        return shadows[key]
 
     A, b = _constrained_system(ds, cons)
     n = len(ds.axes)
@@ -174,28 +166,27 @@ def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
     ]
     result = {**base, "feasible": True, "polygon": poly_phys, "boxiness": boxiness}
     if key is not None:
-        _SHADOW_CACHE[key] = result
+        shadows[key] = result
     return result
 
 
 def shadow_pairs(ds):
-    """All 45 axis pairs ranked by 'interestingness' (1 - boxiness of the exact
-    shadow). Expensive on first call (~45x72 LPs), cached afterwards."""
-    global _SHADOW_PAIRS_CACHE
-    if _SHADOW_PAIRS_CACHE is not None:
-        return _SHADOW_PAIRS_CACHE
+    """All 36 axis pairs (C(9,2)) ranked by 'interestingness' (1 - boxiness of the
+    exact shadow). Expensive on first call (~36x72 LPs), cached afterwards."""
+    cached = ds.cache.get("shadow_pairs")
+    if cached is not None:
+        return cached
     out = []
     for i in range(len(ds.axes)):
         for j in range(i + 1, len(ds.axes)):
             s = shadow(ds, ds.axes[i], ds.axes[j])
             out.append({"x": ds.axes[i], "y": ds.axes[j], "boxiness": s["boxiness"]})
     out.sort(key=lambda e: e["boxiness"] if e["boxiness"] is not None else 1.0)
-    _SHADOW_PAIRS_CACHE = out
+    ds.cache["shadow_pairs"] = out
     return out
 
 
-# sampler -> dependence matrices (computed once per sampler on a subsample)
-_DEPENDENCE_CACHE: dict[str, dict] = {}
+# dependence matrices are computed once per sampler on a subsample (ds.cache)
 _DEPENDENCE_N = 1500   # subsample size: distance correlation is O(n^2) in memory
 
 
@@ -206,7 +197,7 @@ def _double_centered(x: np.ndarray) -> np.ndarray:
 
 
 def dependence(ds, sampler: str, n: int = _DEPENDENCE_N) -> dict:
-    """Pairwise statistical dependence between the 10 axes, three ways:
+    """Pairwise statistical dependence between the 9 technology axes, three ways:
 
     - **distance correlation** (dcor): 0 iff independent, [0,1], catches nonlinear /
       non-monotonic coupling. The statistical analogue of the geometric facet
@@ -217,8 +208,9 @@ def dependence(ds, sampler: str, n: int = _DEPENDENCE_N) -> dict:
     All three are affine-invariant per axis, so normalized vs physical units give
     identical results; computed on a deterministic subsample (dCor is O(n^2)).
     Cached per sampler (the samples are static)."""
-    if sampler in _DEPENDENCE_CACHE:
-        return _DEPENDENCE_CACHE[sampler]
+    dep_cache = _slot(ds, "dependence", {})       # sampler -> matrices
+    if sampler in dep_cache:
+        return dep_cache[sampler]
 
     X_full = ds.get_samples(sampler, "norm")          # (N, 10)
     N, d = X_full.shape
@@ -259,7 +251,7 @@ def dependence(ds, sampler: str, n: int = _DEPENDENCE_N) -> dict:
         "mi": mi.tolist(),
         "pearson": pearson.tolist(),
     }
-    _DEPENDENCE_CACHE[sampler] = result
+    dep_cache[sampler] = result
     return result
 
 
@@ -267,10 +259,9 @@ def flexibility(ds, constraints=None):
     """Exact remaining feasible [min, max] of every axis under the user's
     constraints (two LPs per axis), in physical units. The MGA 'how far can each
     lever still go' question, answered on the polytope rather than the sample."""
-    global _FLEX_BASE_CACHE
     cons = constraints or []
-    if not cons and _FLEX_BASE_CACHE is not None:
-        return _FLEX_BASE_CACHE
+    if not cons and ds.cache.get("flex_base") is not None:
+        return ds.cache["flex_base"]
 
     A, b = _constrained_system(ds, cons)
     # Feasibility only requires non-emptiness (the Chebyshev LP is infeasible iff
@@ -300,7 +291,7 @@ def flexibility(ds, constraints=None):
         })
     result = {"feasible": True, "ranges": ranges}
     if not cons:
-        _FLEX_BASE_CACHE = result
+        ds.cache["flex_base"] = result
     return result
 
 
@@ -393,16 +384,13 @@ def volume_ratio(ds, constraints, seed: int = 42, pop: int = 4000,
     }
 
 
-# sampler -> list of extreme designs (computed once; the polytope is static)
-_EXTREMES_CACHE: dict[str, list] = {}
-
-
 def extremes(ds, sampler: str):
     """For every technology, the designs with its minimum / maximum value over the
     near-optimal polytope (one LP per direction) — the classic MGA extreme
     alternatives. Returns physical values + position in the base PCA space."""
-    if sampler in _EXTREMES_CACHE:
-        return _EXTREMES_CACHE[sampler]
+    ext_cache = _slot(ds, "extremes", {})         # sampler -> extreme designs
+    if sampler in ext_cache:
+        return ext_cache[sampler]
     from sklearn.decomposition import PCA
 
     base = ds.get_samples(sampler, "norm")[:, ds.tech_idx]
@@ -427,7 +415,7 @@ def extremes(ds, sampler: str):
                 "values": phys.tolist(),
                 "point": pt.astype(float).tolist(),
             })
-    _EXTREMES_CACHE[sampler] = out
+    ext_cache[sampler] = out
     return out
 
 

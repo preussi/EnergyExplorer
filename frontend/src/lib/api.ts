@@ -3,6 +3,8 @@
 export interface DatasetInfo {
   name: string;
   is_default: boolean;
+  /** session id — persist it to come back to this dataset after a refresh */
+  id: string | null;
 }
 
 export interface Meta {
@@ -56,12 +58,52 @@ export interface ColorData {
   categorical: boolean;
 }
 
+// ---- dataset session ----
+// Which dataset this browser is looking at. The backend keeps one per session
+// (see backend/app/sessions.py), so every request has to say which one it means
+// — otherwise a second user's build would swap the first user's data out. Sent
+// as a header rather than a query param so it can't be lost by a caller
+// assembling a URL by hand; the backend also accepts `?ds=` for shareable links.
+const DS_KEY = "ee.datasetId";
+let datasetId: string | null = null;
+
+export function setDatasetId(id: string | null): void {
+  datasetId = id;
+  try {
+    if (id) localStorage.setItem(DS_KEY, id);
+    else localStorage.removeItem(DS_KEY);
+  } catch {
+    /* private mode / storage disabled — the id still works for this page view */
+  }
+}
+
+export function getDatasetId(): string | null {
+  return datasetId;
+}
+
+/** The id to boot with: an explicit `?ds=` in the URL wins over what this
+ *  browser used last, so a shared link always opens the dataset it names. */
+export function storedDatasetId(): string | null {
+  const fromUrl = new URLSearchParams(location.search).get("ds");
+  if (fromUrl) return fromUrl;
+  try {
+    return localStorage.getItem(DS_KEY);
+  } catch {
+    return null;
+  }
+}
+
+/** Thrown-away marker: the backend no longer knows this session (404). */
+export class UnknownDataset extends Error {}
+
 // Retry only when fetch() itself rejects — a network-level blip ("Failed to
 // fetch": server restart, dropped/aborted connection). HTTP errors (4xx/5xx)
 // resolve and are handled by the callers, so a real 425/400 is never retried.
 async function fetchRetry(url: string, init?: RequestInit, retries = 1): Promise<Response> {
   try {
-    return await fetch(url, init);
+    const headers = new Headers(init?.headers);
+    if (datasetId) headers.set("X-Dataset-Id", datasetId);
+    return await fetch(url, { ...init, headers });
   } catch (e) {
     if (retries > 0) {
       await new Promise((r) => setTimeout(r, 400));
@@ -75,7 +117,11 @@ async function getJSON<T>(url: string): Promise<T> {
   const res = await fetchRetry(url);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail ?? `${res.status} ${res.statusText}`);
+    const detail = body.detail ?? `${res.status} ${res.statusText}`;
+    // 404 on a request that carried an id = that session is gone (swept, or the
+    // link came from another deployment). Callers use this to offer a rebuild.
+    if (res.status === 404 && datasetId) throw new UnknownDataset(detail);
+    throw new Error(detail);
   }
   return res.json();
 }
@@ -157,8 +203,12 @@ export function getSamples(
   sampler: string,
   fields: string[],
   space = "phys",
+  sample?: number,
 ): Promise<SamplesData> {
   const p = new URLSearchParams({ sampler, space, fields: fields.join(",") });
+  // same N as getProjection → the backend serves the same seeded subset, so the
+  // rows line up with the projected points (and we don't ship 100k unused rows).
+  if (sample != null) p.set("sample", String(sample));
   return getJSON<SamplesData>(`/api/samples?${p}`);
 }
 

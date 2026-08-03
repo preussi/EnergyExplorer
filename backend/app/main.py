@@ -2,25 +2,24 @@
 from __future__ import annotations
 
 import io
+from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from . import sessions
 from .data import (
     DATA_DIR,
     SPACES,
     Dataset,
     friendly_name,
     get_dataset,
-    is_default,
     list_polytopes,
-    set_active,
     validate_polytope,
 )
 from .generate import dependence as run_dependence
-from .generate import reset_caches
 from .generate import extremes as run_extremes
 from .generate import flexibility as run_flexibility
 from .generate import generate as run_generate
@@ -43,10 +42,44 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "sessions": sessions.stats()}
 
 
-def _meta_dict(ds) -> dict:
+# ---- per-request dataset resolution (multi-tenancy) ----
+# Every endpoint reads *the dataset named by this request*, never module state:
+# that is what lets two users hold two different polytopes at the same time. The
+# id rides along as the `X-Dataset-Id` header (set once in the frontend's fetch
+# wrapper) or as `?ds=` so a URL can be shared and curl/`/docs` stay usable.
+# Id-less requests get the shipped default, which keeps the API explorable.
+def current_id(
+    ds: str | None = Query(None, alias="ds", description="dataset session id"),
+    x_dataset_id: str | None = Header(None, alias="X-Dataset-Id"),
+) -> str | None:
+    return ds or x_dataset_id or None
+
+
+def current_dataset(sid: str | None = Depends(current_id)) -> Dataset:
+    if not sid:
+        return get_dataset()
+    try:
+        return sessions.get(sid)
+    except sessions.UnknownSession:
+        # 404 is the signal the frontend uses to fall back to the landing page
+        raise HTTPException(status_code=404,
+                            detail=f"unknown or expired dataset session {sid!r}")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    sessions.SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    sessions.sweep()          # drop recipes past SESSION_TTL_DAYS
+    yield
+
+
+app.router.lifespan_context = _lifespan
+
+
+def _meta_dict(ds, sid: str | None = None) -> dict:
     return {
         "axes": ds.axes,
         "methods": list(METHODS),
@@ -58,21 +91,24 @@ def _meta_dict(ds) -> dict:
             "norm": ds.optimum_norm.tolist(),
         },
         "diagnostics": ds.diagnostics,
-        "dataset": {"name": ds.name, "is_default": is_default()},
+        # `id` is what the frontend persists (URL + localStorage) to come back to
+        # this exact dataset after a refresh; absent for the shipped default.
+        "dataset": {"name": ds.name, "is_default": sid is None, "id": sid},
     }
 
 
 @app.get("/api/meta")
-def meta():
-    return _meta_dict(get_dataset())
+def meta(ds: Dataset = Depends(current_dataset), sid: str | None = Depends(current_id)):
+    return _meta_dict(ds, sid)
 
 
-def _load_npz_upload(file: UploadFile, kind: str):
+def _load_npz_upload(file: UploadFile, kind: str, raw: bytes | None = None):
     """Read an uploaded .npz into memory, or raise a 400 with a clear message."""
     if not file.filename or not file.filename.lower().endswith(".npz"):
         raise HTTPException(status_code=400, detail=f"{kind} file must be a .npz")
     try:
-        return np.load(io.BytesIO(file.file.read()), allow_pickle=True)
+        return np.load(io.BytesIO(raw if raw is not None else file.file.read()),
+                       allow_pickle=True)
     except Exception as e:  # noqa: BLE001 — surface any npz read failure to the user
         raise HTTPException(status_code=400, detail=f"could not read {kind} .npz: {e}")
 
@@ -81,24 +117,24 @@ def _load_npz_upload(file: UploadFile, kind: str):
 N_MIN, N_MAX = 1000, 100000
 
 
-def _clamp_n(n: int) -> int:
+def _require_n(n: int) -> int:
+    """Reject an out-of-range sample count (422) rather than silently clamping it —
+    a caller asking for 200k should learn it didn't get 200k."""
     if not (N_MIN <= int(n) <= N_MAX):
         raise HTTPException(status_code=422,
                             detail=f"n_samples must be between {N_MIN} and {N_MAX}")
     return int(n)
 
 
-def _activate_and_warm(ds: Dataset) -> dict:
-    """Make ds the active dataset, clear stale caches, then eagerly precompute the
-    heavy views (dependence, facet shadows, extremes, base flexibility) so the UI
-    opens instantly. Returns the meta payload."""
-    set_active(ds)
-    reset_caches()
+def _warm(ds: Dataset, sid: str) -> dict:
+    """Eagerly precompute the heavy views (dependence, facet shadows, extremes,
+    base flexibility) into this dataset's own caches, so every view opens
+    instantly. Returns the meta payload carrying the session id."""
     run_dependence(ds, "chrrt")
     run_shadow_pairs(ds)       # also fills the per-pair shadow cache
     run_extremes(ds, "chrrt")
     run_flexibility(ds, [])
-    return _meta_dict(ds)
+    return _meta_dict(ds, sid)
 
 
 @app.get("/api/datasets")
@@ -116,33 +152,56 @@ class BuildPreloadedRequest(BaseModel):
 def build_preloaded(req: BuildPreloadedRequest):
     """Build the active dataset from a preloaded polytope: generate `n_samples`
     hit-and-run samples over it, then precompute every view."""
-    n = _clamp_n(req.n_samples)
+    n = _require_n(req.n_samples)
     stem = req.dataset_id
     path = DATA_DIR / f"{stem}.npz"
     if "/" in stem or ".." in stem or not path.exists():
         raise HTTPException(status_code=404, detail=f"unknown dataset {stem!r}")
-    poly = np.load(path, allow_pickle=True)
+    # Same guards as the upload path: a corrupt or off-schema shipped .npz should
+    # reach the landing page as a readable 422, not an opaque 500 from np.load.
     try:
-        ds = Dataset(poly, name=friendly_name(stem), n_samples=n)
-    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
-        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
-    return _activate_and_warm(ds)
-
-
-@app.post("/api/build/upload")
-def build_upload(polytope: UploadFile = File(...), n_samples: int = Form(20000)):
-    """Build the active dataset from an uploaded polytope .npz (technologies +
-    cost, same schema as the shipped polytope), generating `n_samples` samples."""
-    n = _clamp_n(n_samples)
-    poly = _load_npz_upload(polytope, "polytope")
+        poly = np.load(path, allow_pickle=True)
+    except Exception as e:  # noqa: BLE001 — surface any npz read failure to the user
+        raise HTTPException(status_code=422, detail=f"could not read dataset {stem!r}: {e}")
     problems = validate_polytope(poly)
     if problems:
         raise HTTPException(status_code=422, detail={"errors": problems})
     try:
-        ds = Dataset(poly, name=polytope.filename or "uploaded polytope", n_samples=n)
+        sid, ds = sessions.create(poly, source="preloaded", stem=stem,
+                                  n_samples=n, name=friendly_name(stem))
     except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
         raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
-    return _activate_and_warm(ds)
+    return _warm(ds, sid)
+
+
+@app.post("/api/build/upload")
+def build_upload(polytope: UploadFile = File(...), n_samples: int = Form(20000)):
+    """Build a dataset from an uploaded polytope .npz (technologies + cost, same
+    schema as the shipped polytope), generating `n_samples` samples."""
+    n = _require_n(n_samples)
+    raw = polytope.file.read() if polytope.file else b""
+    poly = _load_npz_upload(polytope, "polytope", raw)
+    problems = validate_polytope(poly)
+    if problems:
+        raise HTTPException(status_code=422, detail={"errors": problems})
+    try:
+        # the uploaded polytope exists nowhere else — store it so the session can
+        # be rebuilt after a restart
+        sid, ds = sessions.create(poly, source="upload", poly_bytes=raw, n_samples=n,
+                                  name=polytope.filename or "uploaded polytope")
+    except Exception as e:  # noqa: BLE001 — construction failures → 422 with context
+        raise HTTPException(status_code=422, detail=f"failed to build dataset: {e}")
+    return _warm(ds, sid)
+
+
+def _display_subset(n: int, sample: int | None) -> np.ndarray:
+    """Row ids to serve for a `sample=N` display request: seeded and sorted, so
+    every endpoint honouring `sample` returns the *same* designs — the frontend
+    pairs projected points with their raw values positionally."""
+    if sample is None or sample >= n:
+        return np.arange(n)
+    rng = np.random.default_rng(42)
+    return np.sort(rng.choice(n, size=int(sample), replace=False))
 
 
 @app.get("/api/projection")
@@ -151,8 +210,8 @@ def projection(
     sampler: str = Query("chrrt"),
     dims: int = Query(2, ge=2, le=3),
     sample: int | None = Query(None, description="optionally downsample to N points"),
+    ds: Dataset = Depends(current_dataset),
 ):
-    ds = get_dataset()
     try:
         pts, ev, cached, opt, comp = project(ds, method, sampler, dims)
     except KeyError as e:
@@ -161,11 +220,8 @@ def projection(
         # 425 Too Early: the expensive projection hasn't been built yet.
         raise HTTPException(status_code=425, detail=str(e))
 
-    n = pts.shape[0]
-    index = np.arange(n)
-    if sample is not None and sample < n:
-        rng = np.random.default_rng(42)
-        index = np.sort(rng.choice(n, size=sample, replace=False))
+    index = _display_subset(pts.shape[0], sample)
+    if len(index) < pts.shape[0]:
         pts = pts[index]
 
     return {
@@ -189,9 +245,9 @@ def color(
     sampler: str = Query("chrrt"),
     field: str = Query("nuclear", description="technology axis name"),
     space: str = Query("phys"),
+    ds: Dataset = Depends(current_dataset),
 ):
     """Per-sample scalar used to color the scatter, aligned to sample row order."""
-    ds = get_dataset()
     if field not in ds.axes:
         raise HTTPException(status_code=400, detail=f"unknown field {field!r}")
     try:
@@ -213,8 +269,12 @@ def samples(
     sampler: str = Query("chrrt"),
     space: str = Query("phys"),
     fields: str = Query(..., description="comma-separated axis names"),
+    sample: int | None = Query(None, description="optionally downsample to N rows"),
+    ds: Dataset = Depends(current_dataset),
 ):
-    ds = get_dataset()
+    """Raw per-design values. Pass `sample=N` (same N as `/api/projection`) to get
+    the identical seeded subset — the cloud can be 100k designs and serializing all
+    of them as JSON is tens of MB the UI never draws."""
     try:
         data = ds.get_samples(sampler, space)
     except KeyError as e:
@@ -226,18 +286,18 @@ def samples(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"unknown field: {e}")
 
+    index = _display_subset(data.shape[0], sample)
     return {
         "fields": names,
-        "values": data[:, cols].astype(float).tolist(),
-        "index": list(range(data.shape[0])),
+        "values": data[np.ix_(index, cols)].astype(float).tolist(),
+        "index": index.astype(int).tolist(),
     }
 
 
 @app.get("/api/extremes")
-def extremes(sampler: str = Query("chrrt")):
+def extremes(sampler: str = Query("chrrt"), ds: Dataset = Depends(current_dataset)):
     """MGA extreme designs: per technology, its min and max over the polytope
     (LP vertices), as physical values + base-PCA coordinates."""
-    ds = get_dataset()
     return {"sampler": sampler, "extremes": run_extremes(ds, sampler)}
 
 
@@ -265,24 +325,22 @@ class FlexibilityRequest(BaseModel):
 
 
 @app.get("/api/dependence")
-def dependence(sampler: str = Query("chrrt")):
+def dependence(sampler: str = Query("chrrt"), ds: Dataset = Depends(current_dataset)):
     """Pairwise dependence between the 10 axes: distance correlation, mutual
     information, and Pearson. Distance correlation/MI catch the nonlinear coupling
     that Pearson misses in the uniform near-optimal cloud."""
-    ds = get_dataset()
     return run_dependence(ds, sampler)
 
 
 @app.get("/api/shadow_pairs")
-def shadow_pairs():
+def shadow_pairs(ds: Dataset = Depends(current_dataset)):
     """All axis pairs ranked by shadow interestingness (ascending boxiness)."""
-    return {"pairs": run_shadow_pairs(get_dataset())}
+    return {"pairs": run_shadow_pairs(ds)}
 
 
 @app.post("/api/shadow")
-def shadow(req: ShadowRequest):
+def shadow(req: ShadowRequest, ds: Dataset = Depends(current_dataset)):
     """Exact 2-D shadow polygon of the (optionally constrained) polytope."""
-    ds = get_dataset()
     try:
         return run_shadow(ds, req.x, req.y, [c.model_dump() for c in req.constraints])
     except KeyError as e:
@@ -290,27 +348,24 @@ def shadow(req: ShadowRequest):
 
 
 @app.post("/api/flexibility")
-def flexibility(req: FlexibilityRequest):
+def flexibility(req: FlexibilityRequest, ds: Dataset = Depends(current_dataset)):
     """Exact remaining [min, max] per axis under the given constraints."""
-    ds = get_dataset()
     return run_flexibility(ds, [c.model_dump() for c in req.constraints])
 
 
 @app.post("/api/volume")
-def volume(req: FlexibilityRequest):
+def volume(req: FlexibilityRequest, ds: Dataset = Depends(current_dataset)):
     """Relative volume of the constrained near-optimal region vs the whole space
     ('how much of the design space survives these constraints'). Subset-simulation
     estimate so it stays accurate deep in the tail, where the uniform-sample
     fraction the UI computes lands zero points."""
-    ds = get_dataset()
     return run_volume(ds, [c.model_dump() for c in req.constraints])
 
 
 @app.post("/api/generate")
-def generate(req: GenerateRequest):
+def generate(req: GenerateRequest, ds: Dataset = Depends(current_dataset)):
     """Add the user's constraints to the polytope and re-sample fresh candidate
     designs from the constrained near-optimal region (projected into PCA space)."""
-    ds = get_dataset()
     cons = [c.model_dump() for c in req.constraints]
     return run_generate(ds, req.sampler, req.n, cons, seed=req.seed)
 
@@ -321,13 +376,13 @@ def clusters(
     sampler: str = Query("chrrt"),
     dims: int = Query(2, ge=2, le=3),
     k: int = Query(6, ge=2, le=12),
+    ds: Dataset = Depends(current_dataset),
 ):
     """K-means clusters of the projected designs, each characterized by the
     technologies that most distinguish it from the overall mean. Returns centroid
     positions in projection space (so the UI can label them on the scatter)."""
     from sklearn.cluster import KMeans
 
-    ds = get_dataset()
     try:
         pts, _, _, _, _ = project(ds, method, sampler, dims)
     except KeyError as e:

@@ -95,6 +95,12 @@ class Dataset:
     def __init__(self, poly, samp=None, name: str = "",
                  n_samples: int | None = None, seed: int = 42):
         self.name = name
+        self.seed = seed
+        # Every polytope-derived cache (shadows, dependence, extremes, base
+        # flexibility) hangs off the dataset it was computed for. They used to be
+        # module globals, which silently made the backend single-tenant: a second
+        # user's build would serve the first user's cached LPs.
+        self.cache: dict = {}
 
         names = [str(n) for n in poly["name_list"]]        # 10 (last = cost)
         cost_col = names.index(COST_AXIS)
@@ -223,9 +229,8 @@ def validate_polytope(poly) -> list[str]:
     return problems
 
 
-# ---- active-dataset management (default file data vs. an uploaded override) ----
+# ---- the shipped default dataset (id-less requests; see sessions.py otherwise) ----
 _DEFAULT: Dataset | None = None   # lazily-built file-based dataset
-_ACTIVE: Dataset | None = None    # uploaded override; None → use the default
 
 
 def list_polytopes() -> list[dict]:
@@ -259,20 +264,8 @@ def load_default() -> Dataset:
 
 
 def get_dataset() -> Dataset:
-    """The dataset every endpoint reads: the uploaded override if one is active,
-    otherwise the shipped default."""
-    return _ACTIVE if _ACTIVE is not None else load_default()
-
-
-def set_active(ds: Dataset | None) -> None:
-    global _ACTIVE
-    _ACTIVE = ds
-
-
-def reset_active() -> None:
-    """Drop any uploaded dataset and fall back to the shipped default."""
-    set_active(None)
-
-
-def is_default() -> bool:
-    return _ACTIVE is None
+    """The dataset served to requests that carry no session id: the shipped
+    default. Per-user datasets live in :mod:`app.sessions` and are resolved from
+    the request's session id, never from module state — that is what lets two
+    users hold different datasets at the same time."""
+    return load_default()

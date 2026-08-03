@@ -5,14 +5,17 @@ See [DESIGN.md](DESIGN.md) for the architecture sketch and roadmap, and
 [PROCESSES.md](PROCESSES.md) for how every process works (data provenance,
 sampling math, projections, generation, and the visual-analytics overlays).
 
-Phase 0 scaffold: a FastAPI backend that loads the polytope/sample data and
-serves projections, plus a Svelte + regl frontend that renders the 2D PCA
-scatter of 20,000 designs (colored by total cost).
+The app opens on a **landing page**: choose a preloaded polytope (or upload your
+own `.npz`) and a sample count, then "Generate & Explore" builds the dataset — the
+backend **generates a uniform near-optimal sample cloud** from the polytope
+(hit-and-run) and precomputes every view — and drops you into the tool (Coupling
+matrix and a PCA/STAR Map, with parallel coords / violins as a strip under both).
+Clicking a cell in the Coupling matrix opens that pair's exact facet beside it.
 
 ```
-backend/     FastAPI + numpy + scikit-learn (data/ holds the two .npz files,
-             baked into the image)
-frontend/    Svelte + Vite + regl (WebGL scatter)
+backend/     FastAPI + numpy + scikit-learn + scipy
+             (data/ holds only polytope_NN.npz — samples are generated, not shipped)
+frontend/    Svelte 5 + Vite + regl (WebGL scatter, parallel coords, facets, matrix)
 docker-compose.yml
 ```
 
@@ -44,46 +47,36 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-## Precomputing t-SNE / UMAP
+## Data & sampling
 
-PCA runs live. t-SNE and UMAP are expensive on 20k points, so they are
-**precomputed once** into `backend/cache/` as `{method}_{sampler}_{dims}d.npy`
-and **mounted into the container** (the `./backend/cache:/app/cache` volume in
-`docker-compose.yml`). The files persist across rebuilds — they are build
-artifacts, not baked into the image. Until a file exists, requesting that
-method returns HTTP 425 with a hint.
+Only the **polytope** (`data/polytope_NN.npz`) ships; it is tiny (~46 KB). The
+sample cloud is **generated on demand** from the polytope with uniform hit-and-run
+when you build a dataset from the landing page (default 20k samples; a count
+outside 1k–100k is rejected with 422, not clamped), so there is no large samples
+file and no precomputed projection cache (PCA is live, t-SNE/UMAP were removed).
+See [PROCESSES.md](PROCESSES.md) §4 & §15.
 
-Build all four (`tsne|umap` × `chrrt|har`) inside the running container, writing
-straight into the mounted host folder:
+## Sessions
 
-```bash
-docker compose exec backend python -m app.projections          # skips existing
-docker compose exec backend python -m app.projections --force  # recompute all
-```
-
-The builder logs per-step timing and skips any projection whose `.npy` already
-exists. Typical cost: ~30–40 s per t-SNE, ~5–30 s per UMAP. A `manifest.json`
-lists what was written. UMAP needs `umap-learn` (already enabled in
-`requirements.txt`).
-
-To build locally without Docker instead:
-```bash
-cd backend
-DATA_DIR=./data CACHE_DIR=./cache python -m app.projections
-```
+Building a dataset creates a **session**, and its id goes into the URL
+(`?ds=<id>`) and browser storage. So a refresh drops you back into the same
+dataset rather than the landing page, that link opens it for a colleague too, and
+several people can each hold their own dataset against one backend at the same
+time. Only a few-KB *recipe* is stored per session (which polytope, how many
+samples, which seed) — the cloud is regenerated identically on demand, so sessions
+also survive a backend restart. `docker-compose.yml` mounts `./backend/sessions`
+to keep them across rebuilds. See [PROCESSES.md](PROCESSES.md) §16.
 
 ## API
 
 | endpoint           | purpose                                              |
 |--------------------|------------------------------------------------------|
 | `GET /api/health`  | liveness                                             |
-| `GET /api/meta`    | axes, samplers, methods, optimum, MCMC diagnostics   |
-| `GET /api/projection?method=pca&sampler=chrrt&dims=2[&sample=N]` | projected points + per-point cost |
-| `GET /api/samples?sampler=chrrt&space=phys&fields=nuclear,battery` | raw values (backs parallel coords) |
+| `GET /api/datasets`| preloaded polytopes to build from                    |
+| `POST /api/build/preloaded` · `POST /api/build/upload` | generate the cloud + warm all views; return meta |
+| `GET /api/meta`    | axes, methods, optimum, diagnostics, session id      |
+| `GET /api/projection?method=pca&dims=2[&sample=N]` | projected points + optimum + loadings |
+| `GET /api/samples?space=phys&fields=nuclear,battery[&sample=N]` | raw values (backs parallel coords) |
 
-## Next (Phase 1 / 2)
-
-- Pan/zoom + lasso selection on the scatter
-- Parallel-coordinates view over the 10 axes, with linked brushing
-- Build + serve the t-SNE/UMAP cache
-- Overlay the cost optimum (`u_star`) in every view
+The full endpoint list (dependence, shadow, flexibility, volume, extremes,
+generate, clusters, …) is in [PROCESSES.md](PROCESSES.md) §13.

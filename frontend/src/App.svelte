@@ -5,7 +5,9 @@
     type Meta, type Projection, type ColorData, type SamplesData, type ClustersData,
     type GenerateResult, type ConstraintInput, type ExtremeDesign, type FlexRange,
     type VolumeEstimate, type Dependence, type DependenceMetric, type ShadowPair,
+    setDatasetId, storedDatasetId, UnknownDataset,
   } from "./lib/api";
+  import { onMount } from "svelte";
   import { fly } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import Landing from "./lib/Landing.svelte";
@@ -16,6 +18,7 @@
   import FlexBars from "./lib/FlexBars.svelte";
   import StarWheel from "./lib/StarWheel.svelte";
   import DependenceMatrix from "./lib/DependenceMatrix.svelte";
+  import { clusterOrder } from "./lib/cluster";
 
   let meta = $state<Meta | null>(null);
   let proj = $state<Projection | null>(null);
@@ -54,22 +57,27 @@
   let selected = $state<number[] | null>(null);
   let mode = $state<"pan" | "select">("pan");
 
-  // ---- view mode: projection map vs exact facet (shadow) views ----
-  let viewMode = $state<"profiles" | "map" | "facets" | "coupling">("coupling");
-  // pairwise dependence (dCor / MI / Pearson) for the Coupling tab + facet ranking
+  // ---- view mode: the coupling matrix vs the projection map ----
+  // The exact facet view has no tab of its own: it is reached by clicking a cell
+  // in the Coupling matrix, which docks it beside the matrix (and ⛶ maximizes it).
+  // Parallel coords have no tab either — they are the bottom strip in both views.
+  let viewMode = $state<"map" | "coupling">("coupling");
+  // pairwise dependence (dCor / MI / Pearson) for the Coupling matrix
   let depData = $state<Dependence | null>(null);
   let depMetric = $state<DependenceMetric>("dcor");
-  let shadowPairs = $state<ShadowPair[]>([]);   // boxiness per pair (for the dCor-vs-boxiness check)
-  // a pair to open in the Facets tab (set by clicking a heatmap cell); one-shot,
+  let shadowPairs = $state<ShadowPair[]>([]);   // boxiness per pair (facet fallback order)
+  // a pair to draw in the facet panel (set by clicking a heatmap cell); one-shot,
   // FacetView consumes and clears it (see onconsumepair).
   let facetSel = $state<{ x: string; y: string } | null>(null);
   // whether the Coupling view's docked Facet panel is open (persists across the
   // one-shot facetSel so re-clicking cells doesn't close it). null = closed.
   let couplingPair = $state<{ x: string; y: string } | null>(null);
+  // ⛶ full view: the docked facet takes the whole coupling region (matrix hidden)
+  let couplingFull = $state(false);
 
   // ---- star coordinates (user-steered linear projection) ----
   const isStar = $derived(method === "star");
-  let normTech = $state<number[][] | null>(null); // 20k x 9, normalized tech values
+  let normTech = $state<number[][] | null>(null); // (≤ DISPLAY_N) x 9, normalized tech values
   let starAnchors = $state<[number, number][]>([]);
   let touring = $state(false);
   let tourTimer: ReturnType<typeof setInterval> | null = null;
@@ -80,7 +88,7 @@
     const s = sampler; // discard the response if the sampler changed mid-flight
     const tech = meta.axes; // all 9 axes are technologies
     try {
-      const r = await getSamples(s, tech, "norm");
+      const r = await getSamples(s, tech, "norm", DISPLAY_N);
       if (s === sampler) normTech = r.values;
     } catch (e) { console.warn("normTech load failed:", e); }
   }
@@ -446,7 +454,7 @@
   }
   async function loadSamples() {
     if (!meta) return;
-    try { samples = await getSamples(sampler, meta.axes, "phys"); }
+    try { samples = await getSamples(sampler, meta.axes, "phys", DISPLAY_N); }
     catch (e) { console.warn("samples load failed:", e); }
   }
   async function loadClusters() {
@@ -512,7 +520,7 @@
     normTech = null; starAnchors = [];
     manualConstraints = []; brushConstraints = [];
     sliceAxis = null; volEstimate = null;
-    facetSel = null; couplingPair = null;
+    facetSel = null; couplingPair = null; couplingFull = false;
     shadowPairs = []; depData = null; // force the dependence/shadow-pair effects to refetch
     try {
       const m = await getMeta();
@@ -536,16 +544,66 @@
   // reloadAll() then fetches the (now cache-warm) views. "change dataset" flips this
   // back to false to return to the landing page.
   let started = $state(false);
+  let restoring = $state(true);   // checking for a previous session before deciding
+
+  // The session id is the whole persistence story: the dataset lives on the
+  // backend keyed by it, so remembering the id is enough to come back to the same
+  // cloud after a refresh — and putting it in the URL makes that link shareable.
+  function adoptSession(m: Meta) {
+    const id = m.dataset.id;
+    setDatasetId(id);
+    const url = new URL(location.href);
+    if (id) url.searchParams.set("ds", id);
+    else url.searchParams.delete("ds");
+    history.replaceState(null, "", url);
+  }
+
   function onLandingReady(m: Meta) {
+    adoptSession(m);
     meta = m;
     started = true;
     reloadAll();
   }
 
+  // "⟳ change dataset" also drops the session, so the next load lands on the
+  // landing page rather than restoring the dataset we just walked away from.
+  function changeDataset() {
+    setDatasetId(null);
+    const url = new URL(location.href);
+    url.searchParams.delete("ds");
+    history.replaceState(null, "", url);
+    meta = null;
+    started = false;
+  }
+
+  // Boot: if this browser (or the link that was opened) names a dataset, go
+  // straight back into it instead of the landing page. A 404 means the session is
+  // gone — forget it and let the user build a new one.
+  onMount(async () => {
+    const id = storedDatasetId();
+    if (!id) { restoring = false; return; }
+    setDatasetId(id);
+    try {
+      const m = await getMeta();
+      adoptSession(m);
+      meta = m;
+      started = true;
+      reloadAll();
+    } catch (e) {
+      if (!(e instanceof UnknownDataset)) console.warn("session restore failed:", e);
+      setDatasetId(null);
+      const url = new URL(location.href);
+      url.searchParams.delete("ds");
+      history.replaceState(null, "", url);
+    } finally {
+      restoring = false;
+    }
+  });
+
   // ---- settings ----
   let showSettings = $state(false);
   // per-dimension on/off (keyed by axis name; missing/true = enabled). Disabled
-  // dimensions are hidden from Profiles, Coupling, Facets, and the color/slice
+  // dimensions are hidden from the parallel coords, the Coupling matrix, the facet, and the color/slice
   // pickers. The Map (PCA) projection always uses all technologies.
   let dimEnabled = $state<Record<string, boolean>>({});
   let reduceMotion = $state(false);
@@ -561,12 +619,21 @@
     dimEnabled = Object.fromEntries((meta?.axes ?? []).map((a) => [a, on]));
   }
   // If the color/slice axis gets disabled, fall back gracefully.
+  // Converges in one step: each guard's condition is false once it has fired.
   $effect(() => {
     if (field && dimEnabled[field] === false) { field = ""; loadColor(); }
     if (sliceAxis && dimEnabled[sliceAxis] === false) exitSlice();
+    // The docked coupling facet must not outlive its axes: without this it keeps
+    // captioning a dimension the user just switched off, and — since the split is
+    // what hides the validation scatter — leaves it hidden with no cell selected.
+    const dropped = (p: { x: string; y: string } | null) =>
+      !!p && (dimEnabled[p.x] === false || dimEnabled[p.y] === false);
+    if (dropped(couplingPair)) { couplingPair = null; couplingFull = false; }
+    if (dropped(facetSel)) facetSel = null;
   });
-  // Coupling view honours the toggles: subset the dependence matrices + shadow-pair
-  // list to the active axes only (the DependenceMatrix seriates whatever it's given).
+  // Coupling view honours the toggles: subset the dependence matrices to the active
+  // axes only (the DependenceMatrix re-clusters whatever it's given). FacetView does
+  // its own filtering from `activeAxes`, so the pair list is passed through whole.
   const depView = $derived.by(() => {
     const dp = depData;
     if (!dp) return null;
@@ -579,7 +646,6 @@
       dcor: sub(dp.dcor), mi: sub(dp.mi), pearson: sub(dp.pearson),
     };
   });
-  const pairsView = $derived(shadowPairs.filter((p) => dimEnabled[p.x] !== false && dimEnabled[p.y] !== false));
 
   // ---- axis captions ----
   function topTechs(comp: number[], names: string[], k = 2): string {
@@ -608,9 +674,12 @@
   // through this, so dispPoints[i] / dispValues[i] / dispColorValues[i] /
   // dispNormTech[i] all refer to the same design i — selection stays positional.
   const subIndex = $derived(!candidates && proj ? proj.index : null);
-  const dispNormTech = $derived(
-    subIndex && normTech ? subIndex.map((r) => normTech![r]) : normTech,
-  );
+  // (same DISPLAY_N-subset-or-gather rule as dispValues below)
+  const dispNormTech = $derived.by(() => {
+    const nt = normTech;
+    if (!subIndex || !nt) return nt;
+    return nt.length === subIndex.length ? nt : subIndex.map((r) => nt[r]);
+  });
   const dispPoints = $derived(
     candidates ? candidates.points : isStar ? starPoints : (proj?.points ?? []),
   );
@@ -621,7 +690,11 @@
   const dispValues = $derived.by(() => {
     if (candidates) return candidates.values;
     const v = samples?.values ?? [];
-    return subIndex && v.length ? subIndex.map((r) => v[r]) : v;
+    if (!subIndex || !v.length) return v;
+    // /api/samples is fetched with the same DISPLAY_N as the projection, so it
+    // already returns exactly the displayed rows, in order. Only gather by global
+    // row id when it handed back the full cloud (no/ignored `sample=`).
+    return v.length === subIndex.length ? v : subIndex.map((r) => v[r]);
   });
 
   // ---- slice / sweep (cut one axis, watch the other levers' densities & ranges
@@ -717,7 +790,8 @@
   const techLabels = $derived(
     (samples?.fields ?? []).filter((f) => f !== "net_present_cost").map(short),
   );
-  // full-space per-technology ranges (stable reference for radar glyphs / kNN)
+  // per-technology ranges over the served cloud — a stable reference for radar
+  // glyphs / kNN that doesn't move with brushes or the candidate set
   const techRanges = $derived.by(() => {
     if (!samples) return [];
     const idx = samples.fields.map((_, j) => j).filter((j) => samples!.fields[j] !== "net_present_cost");
@@ -770,31 +844,8 @@
   // Order the parallel-coords axes so strongly-coupled ones (high distance
   // correlation) sit next to each other, making trade-offs read between neighbors.
   let couplingAxes = $state(true);
-  // Greedy seriation: start from the most-coupled pair, then repeatedly attach the
-  // unused axis most coupled to either end of the growing chain.
-  function couplingSeriation(D: number[][]): number[] {
-    const n = D.length;
-    if (n < 2) return Array.from({ length: n }, (_, i) => i);
-    let bi = 0, bj = 1, best = -Infinity;
-    for (let i = 0; i < n; i++)
-      for (let j = i + 1; j < n; j++)
-        if (D[i][j] > best) { best = D[i][j]; bi = i; bj = j; }
-    const order = [bi, bj];
-    const used = new Set(order);
-    while (order.length < n) {
-      const head = order[0], tail = order[order.length - 1];
-      let node = -1, sim = -Infinity, atHead = false;
-      for (let k = 0; k < n; k++) {
-        if (used.has(k)) continue;
-        if (D[tail][k] > sim) { sim = D[tail][k]; node = k; atHead = false; }
-        if (D[head][k] > sim) { sim = D[head][k]; node = k; atHead = true; }
-      }
-      if (node < 0) break;
-      used.add(node);
-      if (atHead) order.unshift(node); else order.push(node);
-    }
-    return order;
-  }
+  // Same hierarchical clustering the Coupling matrix uses (see cluster.ts), so the
+  // two views agree on what "next to each other" means.
   // Permutation of dispFields column indices; [] means canonical order.
   const axisOrder = $derived.by(() => {
     if (!couplingAxes || !depData?.dcor?.length || !dispFields.length) return [];
@@ -803,7 +854,7 @@
     const n = dispFields.length;
     const D = Array.from({ length: n }, (_, i) =>
       Array.from({ length: n }, (_, j) => depData!.dcor[idx[i]][idx[j]] ?? 0));
-    return couplingSeriation(D);
+    return clusterOrder(D);
   });
   function reorder<T>(arr: T[], ord: number[]): T[] { return ord.map((i) => arr[i]); }
   // Column order+filter for ONLY the parallel-coords props: the coupling seriation
@@ -931,7 +982,9 @@
   });
 </script>
 
-{#if !started}
+{#if restoring}
+  <div class="restoring">restoring your dataset…</div>
+{:else if !started}
   <Landing onready={onLandingReady} />
 {:else}
 <div class="stage" role="presentation" onmousemove={onMove}>
@@ -939,28 +992,22 @@
   <header class="hud panel topbar">
     <div class="brand">
       <h1>Energy Explorer <small>near-optimal energy-system designs</small></h1>
-      <button class="change-ds" title="pick or upload another dataset" onclick={() => (started = false)}>⟳ change dataset</button>
+      <button class="change-ds" title="pick or upload another dataset" onclick={changeDataset}>⟳ change dataset</button>
       <button class="change-ds" class:on={showSettings} title="settings"
               aria-label="settings" onclick={() => (showSettings = !showSettings)}>⚙ settings</button>
     </div>
     <div class="seg view-seg">
       <button class:active={viewMode === "coupling"} onclick={() => (viewMode = "coupling")}>Coupling</button>
-      <button class:active={viewMode === "profiles"} onclick={() => (viewMode = "profiles")}>Profiles</button>
-      <button class:active={viewMode === "facets"} onclick={() => (viewMode = "facets")}>Facets</button>
       <button class:active={viewMode === "map"} onclick={() => (viewMode = "map")}>Map</button>
     </div>
-    {#if viewMode === "profiles"}
-      <span class="topbar-hint">marginal distribution of each lever (violins) · brush an axis to filter · pinned designs & the A→B path overlay as lines</span>
-    {:else if proj && viewMode === "map"}
+    {#if proj && viewMode === "map"}
       <span class="topbar-hint">
         {mode === "select" ? "drag to lasso-select" : "scroll to zoom · drag to pan · click a point to pin"}
         {#if isStar} · drag ◯ / pins to rotate the projection{/if}
         {#if !isMetric} · {method.toUpperCase()} axes are non-metric{/if}
       </span>
-    {:else if viewMode === "facets"}
-      <span class="topbar-hint">exact trade-off boundaries of the near-optimal space · brush below to constrain</span>
     {:else if viewMode === "coupling"}
-      <span class="topbar-hint">nonlinear dependence between axes (distance correlation / mutual information) · click a cell → its facet</span>
+      <span class="topbar-hint">nonlinear dependence between axes (distance correlation / mutual information) · click a cell → its exact facet · brush below to constrain</span>
     {/if}
   </header>
 
@@ -986,7 +1033,7 @@
             {short(a)}
           </label>
         {/each}
-        <span class="muted small">{nActive} of {meta?.axes.length ?? 0} on · shown in Profiles, Coupling & Facets. The Map (PCA) always uses all technologies.</span>
+        <span class="muted small">{nActive} of {meta?.axes.length ?? 0} on · shown in the parallel coords and the Coupling matrix (and the facet it opens). The Map (PCA) always uses all technologies.</span>
       </div>
 
       <div class="set-sect">
@@ -1007,11 +1054,10 @@
 
   <!-- borderless graph between the panels -->
   {#if viewMode === "coupling"}
-    <div class="graph-region coupling-split" class:split={couplingPair}>
+    <div class="graph-region coupling-split" class:split={couplingPair} class:facet-full={couplingPair && couplingFull}>
       <div class="cpl-matrix">
         <DependenceMatrix
           dep={depView}
-          pairs={pairsView}
           metric={depMetric}
           onmetric={(m) => (depMetric = m)}
           onpair={(x, y) => { facetSel = { x, y }; couplingPair = { x, y }; }}
@@ -1021,8 +1067,12 @@
         <div class="cpl-facet" transition:fly={{ x: 60, duration: reduceMotion ? 0 : 280, easing: cubicOut }}>
           <div class="cpl-facet-head">
             <span class="cpl-facet-title">exact facet · {short(couplingPair.x)} × {short(couplingPair.y)}</span>
+            <button class="cpl-full" title={couplingFull ? "back to the matrix" : "expand the facet over the matrix"}
+                    onclick={() => (couplingFull = !couplingFull)}>
+              {couplingFull ? "⛶ exit full view" : "⛶ full view"}
+            </button>
             <button class="cpl-close" title="close facet panel" aria-label="close facet panel"
-                    onclick={() => (couplingPair = null)}>✕</button>
+                    onclick={() => { couplingPair = null; couplingFull = false; }}>✕</button>
           </div>
           {#if dispFields.length}
             <div class="cpl-facet-body">
@@ -1036,32 +1086,13 @@
                 colorMax={dispColorMax}
                 constraints={allConstraints}
                 selected={candidates ? null : selected}
-                dependence={depView}
                 selectPair={facetSel}
+                {shadowPairs}
                 onconsumepair={() => (facetSel = null)}
               />
             </div>
           {/if}
         </div>
-      {/if}
-    </div>
-  {:else if viewMode === "facets"}
-    <div class="graph-region">
-      {#if dispFields.length}
-        <FacetView
-          fields={dispFields}
-          values={dispValues}
-          activeFields={activeAxes}
-          colorValues={dispColorValues}
-          colorCategorical={dispCategorical}
-          colorMin={dispColorMin}
-          colorMax={dispColorMax}
-          constraints={allConstraints}
-          selected={candidates ? null : selected}
-          dependence={depView}
-          selectPair={facetSel}
-          onconsumepair={() => (facetSel = null)}
-        />
       {/if}
     </div>
   {:else if viewMode === "map" && proj}
@@ -1098,7 +1129,8 @@
     </div>
   {/if}
 
-  {#if inCandidates && candidates && (viewMode === "map" || viewMode === "profiles")}
+  <!-- shown in every view: it carries the only way back out of candidate mode -->
+  {#if inCandidates && candidates}
     <div class="hud gen-banner panel">
       <span><span class="dot"></span><strong>{candidates.n.toLocaleString()}</strong> generated candidates</span>
       <button class="link" onclick={backToFull}>← back to full space</button>
@@ -1346,7 +1378,7 @@
   </aside>
 
   <!-- compare tray (right): pinned designs, radar glyphs, A→B morph -->
-  {#if (viewMode === "map" || viewMode === "profiles") && (pins.length || proj?.optimum)}
+  {#if viewMode === "map" && (pins.length || proj?.optimum)}
     <section class="hud panel tray">
       <div class="tray-head">
         <span>Pinned designs</span>
@@ -1414,9 +1446,9 @@
     </section>
   {/if}
 
-  <!-- parallel-coordinates panel: bottom strip elsewhere, full stage in Profiles -->
+  <!-- parallel-coordinates panel: the bottom strip of every view -->
   {#if dispValues.length}
-    <section class="hud panel pc-panel" class:full={viewMode === "profiles"}>
+    <section class="hud panel pc-panel">
       <div class="pc-head">
         <span>
           Parallel coordinates · {dispFields.length} axes · colored by {short(field)}
@@ -1518,18 +1550,28 @@
   .coupling-split { display: flex; gap: 14px; min-height: 0; overflow: hidden; }
   .coupling-split .cpl-matrix { flex: 1 1 100%; min-width: 0; min-height: 0; }
   .coupling-split.split .cpl-matrix { flex: 1 1 50%; }
-  /* facet panel: a header row (title + close) above the FacetView, so the close
-     button never overlaps FacetView's own controls (e.g. the rank dropdown). */
+  /* ⛶ full view: the facet takes the whole region and the matrix steps aside. */
+  .coupling-split.facet-full .cpl-matrix { display: none; }
+  .coupling-split.facet-full .cpl-facet { border-left: none; padding-left: 0; }
+  /* facet panel: a header row (title + full view + close) above the FacetView, so
+     the buttons never overlap FacetView's own controls (e.g. ⇄ swap axes). */
   .cpl-facet {
     flex: 1 1 50%; min-width: 0; min-height: 0;
     display: flex; flex-direction: column; gap: 6px;
     border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 14px;
   }
-  .cpl-facet-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .cpl-facet-head { flex: none; display: flex; align-items: center; gap: 8px; }
   .cpl-facet-title {
+    flex: 1; min-width: 0;
     font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .cpl-full {
+    flex: none; font-size: 11px; padding: 3px 9px; border-radius: 7px; line-height: 1.3;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--muted); cursor: pointer; white-space: nowrap;
+  }
+  .cpl-full:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--accent); color: var(--fg); }
   .cpl-facet-body { flex: 1; min-height: 0; position: relative; }
   .cpl-close {
     flex: none; display: flex; align-items: center; justify-content: center;
@@ -1698,14 +1740,15 @@
     display: flex; flex-direction: column; gap: 6px;
     padding: 12px 16px;
   }
-  /* Profiles view: parallel coords fill the main stage (leaving the left controls
-     and the right compare tray their gutters). */
-  .pc-panel.full {
-    top: 80px; right: 264px; bottom: 16px; height: auto;
-  }
   .pc-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--fg); }
   .pc-body { flex: 1; min-height: 0; }
 
+  /* shown for the one round-trip that checks whether a stored session is still
+     alive — without it the landing page flashes before the dataset comes back */
+  .restoring {
+    position: fixed; inset: 0;
+    display: grid; place-items: center; color: var(--muted); font-size: 14px;
+  }
   .overlay {
     position: absolute; inset: 0; z-index: 1;
     display: grid; place-items: center; color: var(--muted); font-size: 14px;

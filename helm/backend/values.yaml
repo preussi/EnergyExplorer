@@ -64,8 +64,8 @@ app:
     memory: null
     ephemeralStorage: null
 
-  # No persistent volumes: data is in the image, the projection cache is
-  # ephemeral (PCA runs live; t-SNE/UMAP return 425 until a cache is built).
+  # No persistent volumes: the polytope is in the image, samples are generated at
+  # build time, and PCA (the only projection) runs live — there is no cache.
   pvcs: []
 
   ingress:

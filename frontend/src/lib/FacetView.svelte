@@ -1,15 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { scaleLinear } from "d3-scale";
-  import { getShadowPairs, getShadow, type Shadow, type ShadowPair, type ConstraintInput,
-           type Dependence, type DependenceMetric } from "./api";
+  import { getShadow, type Shadow, type ShadowPair, type ConstraintInput } from "./api";
   import { colorFor } from "./colors";
 
-  type RankMetric = "boxiness" | DependenceMetric;
-
-  // Facet views: the exact 2-D shadow (orthogonal projection) of the near-optimal
-  // polytope per axis pair — boundaries computed by LPs on the backend, samples
+  // Facet view: the exact 2-D shadow (orthogonal projection) of the near-optimal
+  // polytope for one axis pair — boundary computed by LPs on the backend, samples
   // drawn inside for density. The MGA-standard way to read trade-off facets.
+  // Which pair is shown is the caller's business: the Coupling matrix drives it
+  // through `selectPair`, so there is no picker or ranked list in here.
   let {
     fields = [],
     values = [],
@@ -20,8 +19,8 @@
     colorMax = 1,
     constraints = [],
     selected = null,
-    dependence = null,
     selectPair = null,
+    shadowPairs = [],
     onconsumepair,
   }: {
     fields: string[];
@@ -33,8 +32,11 @@
     colorMax?: number;
     constraints?: ConstraintInput[];
     selected?: number[] | null;
-    dependence?: Dependence | null;     // dCor/MI/Pearson, for alternative rankings
     selectPair?: { x: string; y: string } | null;  // one-shot drill-down from the heatmap
+    /** boxiness-ranked pairs the parent already holds. Only used to fall back to a
+        still-valid pair if the drawn one's axes get disabled — we never fetch them
+        ourselves (the matrix that drives us is built from the same payload). */
+    shadowPairs?: ShadowPair[];
     onconsumepair?: () => void;         // ask the parent to clear selectPair once applied
   } = $props();
 
@@ -53,31 +55,13 @@
     : Math.abs(v) >= 100 ? v.toFixed(0)
     : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(2);
 
-  let pairs = $state<ShadowPair[]>([]);
-  let pairsLoading = $state(true);
   let sel = $state<{ x: string; y: string } | null>(null);
-  let rankMetric = $state<RankMetric>("boxiness");
 
-  // Re-rank the 45 pairs: boxiness ascending (most structured first) or, when a
-  // dependence matrix is available, by |dCor|/|MI|/|Pearson| descending (strongest
-  // coupling first). Same geometric small-multiples, different ordering lens.
-  const rankedPairs = $derived.by(() => {
-    const ps = pairs.filter(pairActive);
-    if (rankMetric === "boxiness" || !dependence)
-      return ps.sort((a, b) => (a.boxiness ?? 1) - (b.boxiness ?? 1));
-    const m = rankMetric;
-    const val = (p: ShadowPair) => {
-      const i = dependence!.axes.indexOf(p.x), j = dependence!.axes.indexOf(p.y);
-      return i >= 0 && j >= 0 ? Math.abs(dependence![m][i][j]) : 0;
-    };
-    return ps.sort((a, b) => val(b) - val(a));
-  });
-  function scoreOf(p: ShadowPair): string {
-    if (rankMetric === "boxiness" || !dependence)
-      return p.boxiness == null ? "" : `${Math.round((1 - p.boxiness) * 100)}%`;
-    const i = dependence.axes.indexOf(p.x), j = dependence.axes.indexOf(p.y);
-    return i >= 0 && j >= 0 ? dependence[rankMetric][i][j].toFixed(2) : "";
-  }
+  // Still-drawable pairs, most structured (lowest boxiness) first — the fallback
+  // order when the drawn pair stops being valid.
+  const activePairs = $derived(
+    shadowPairs.filter(pairActive).sort((a, b) => (a.boxiness ?? 1) - (b.boxiness ?? 1)),
+  );
 
   // drill-down: a pair picked in the Coupling heatmap selects it here. selectPair
   // is a one-shot command — apply it, then ask the parent to clear it. Critically,
@@ -98,13 +82,6 @@
   const M = { top: 14, right: 16, bottom: 34, left: 58 };
 
   onMount(() => {
-    getShadowPairs()
-      .then((r) => {
-        pairs = r.pairs;
-        pairsLoading = false;
-        if (!sel && rankedPairs.length) sel = { x: rankedPairs[0].x, y: rankedPairs[0].y };
-      })
-      .catch((e) => { err = (e as Error).message; pairsLoading = false; });
     const ro = new ResizeObserver(() => {
       if (!plotEl) return;
       W = plotEl.clientWidth;
@@ -118,9 +95,9 @@
   // fall back to the top still-active pair so the plot never shows a hidden axis.
   // Converges in one step: once sel is an active pair the condition is false.
   $effect(() => {
-    if (!pairs.length) return;
-    if ((sel && !pairActive(sel)) || (!sel && rankedPairs.length)) {
-      sel = rankedPairs.length ? { x: rankedPairs[0].x, y: rankedPairs[0].y } : null;
+    if (!shadowPairs.length) return;
+    if ((sel && !pairActive(sel)) || (!sel && activePairs.length)) {
+      sel = activePairs.length ? { x: activePairs[0].x, y: activePairs[0].y } : null;
     }
   });
 
@@ -226,28 +203,6 @@
     ctx.globalAlpha = 1;
   });
 
-  // mini polygon paths for the small-multiple cards (own local scales, 84x64 box).
-  // `requested` is deliberately non-reactive: the effect must not depend on
-  // miniPaths, or every arriving response would re-trigger it and re-fetch
-  // everything still in flight.
-  let miniPaths = $state<Record<string, string>>({});
-  const requested = new Set<string>();
-  $effect(() => {
-    for (const p of rankedPairs.slice(0, 10)) {
-      const key = `${p.x}|${p.y}`;
-      if (requested.has(key)) continue;
-      requested.add(key);
-      getShadow(p.x, p.y, []).then((s) => {
-        if (!s.polygon.length) return;
-        const xs = s.polygon.map((q) => q[0]), ys = s.polygon.map((q) => q[1]);
-        const mx = scaleLinear().domain([Math.min(...xs), Math.max(...xs)]).range([4, 80]);
-        const my = scaleLinear().domain([Math.min(...ys), Math.max(...ys)]).range([60, 4]);
-        const d = "M" + s.polygon.map((q) => `${mx(q[0]).toFixed(1)},${my(q[1]).toFixed(1)}`).join("L") + "Z";
-        miniPaths = { ...miniPaths, [key]: d };
-      }).catch(() => { requested.delete(key); });
-    }
-  });
-
 </script>
 
 <div class="facets">
@@ -296,40 +251,11 @@
     </p>
   </div>
 
-  <div class="rank">
-    <div class="rank-head">
-      <span>rank by</span>
-      <select bind:value={rankMetric} aria-label="ranking metric">
-        <option value="boxiness">boxiness</option>
-        <option value="dcor" disabled={!dependence}>dist. corr</option>
-        <option value="mi" disabled={!dependence}>mutual info</option>
-        <option value="pearson" disabled={!dependence}>Pearson</option>
-      </select>
-    </div>
-    {#if pairsLoading}
-      <span class="muted small">ranking 45 facets… (first run computes 3,240 LPs)</span>
-    {/if}
-    {#each rankedPairs.slice(0, 10) as p}
-      <button
-        class="mini-card"
-        class:active={sel?.x === p.x && sel?.y === p.y}
-        onclick={() => (sel = { x: p.x, y: p.y })}
-      >
-        <svg viewBox="0 0 84 64">
-          {#if miniPaths[`${p.x}|${p.y}`]}
-            <path d={miniPaths[`${p.x}|${p.y}`]} class="mini-poly" />
-          {/if}
-        </svg>
-        <span class="mini-label">{short(p.x)} × {short(p.y)}</span>
-        <span class="mini-score" title={rankMetric === "boxiness" ? "how far from a plain rectangle" : rankMetric}>{scoreOf(p)}</span>
-      </button>
-    {/each}
-  </div>
 </div>
 
 <style>
-  .facets { display: grid; grid-template-columns: 1fr 150px; gap: 12px; width: 100%; height: 100%; min-height: 0; }
-  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .facets { display: flex; width: 100%; height: 100%; min-height: 0; }
+  .main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
   .plot { position: relative; flex: 1; min-height: 0; }
   .plot canvas, .plot svg { position: absolute; inset: 0; width: 100%; height: 100%; }
   .plot svg { overflow: visible; pointer-events: none; }
@@ -363,26 +289,5 @@
   }
   .caption { font-size: 11px; margin: 6px 0 0; text-align: center; }
   .muted { color: var(--muted); }
-  .small { font-size: 11px; }
 
-  .rank { display: flex; flex-direction: column; gap: 7px; overflow-y: auto; min-height: 0; padding-right: 2px; }
-  .rank-head { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
-    display: flex; align-items: center; gap: 6px; }
-  .rank-head select {
-    text-transform: none; letter-spacing: normal; font-size: 11px; padding: 1px 4px;
-    background: rgba(255, 255, 255, 0.05); color: var(--fg);
-    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 5px;
-  }
-  .mini-card {
-    display: flex; flex-direction: column; align-items: stretch; gap: 2px;
-    background: rgba(255, 255, 255, 0.025);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 9px; padding: 5px 7px; cursor: pointer; text-align: left;
-  }
-  .mini-card:hover { background: rgba(255, 255, 255, 0.06); }
-  .mini-card.active { border-color: var(--accent); box-shadow: 0 0 8px rgba(45, 212, 191, 0.25); }
-  .mini-card svg { width: 100%; height: 44px; }
-  .mini-poly { fill: rgba(45, 212, 191, 0.12); stroke: var(--accent); stroke-width: 1.4; }
-  .mini-label { font-size: 10.5px; color: var(--fg); }
-  .mini-score { font-size: 10px; color: var(--muted); }
 </style>

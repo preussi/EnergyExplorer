@@ -1,10 +1,12 @@
 services:
   backend:
     build: ./backend
-    # The sample data is baked into the image (see backend/Dockerfile). Only the
-    # projection cache is mounted so t-SNE/UMAP builds persist across rebuilds.
+    # The polytope is baked into the image and PCA runs live, so the only thing
+    # worth persisting is the per-user dataset sessions (a few KB each) — mount
+    # them so a `docker compose up --build` doesn't send everyone back to the
+    # landing page.
     volumes:
-      - ./backend/cache:/app/cache
+      - ./backend/sessions:/app/sessions
     ports:
       - "8000:8000"
 

@@ -1,26 +1,24 @@
 <script lang="ts">
   import { colorFor } from "./colors";
-  import { getShadow, type Dependence, type DependenceMetric, type ShadowPair } from "./api";
+  import { getShadow, type Dependence, type DependenceMetric } from "./api";
+  import { clusterOrder } from "./cluster";
 
-  // Pairwise dependence heatmap over the 10 axes. Distance correlation / mutual
+  // Pairwise dependence heatmap over the 9 technology axes. Distance correlation / mutual
   // information catch the nonlinear coupling Pearson misses in this uniform cloud.
   // The matrix is symmetric, so instead of mirroring the numbers we use the two
   // triangles for two different reads of the same pair: the lower-left holds the
   // dependence value (color + number), the upper-right holds the exact 2-D facet
   // outline (LP shadow) — statistical coupling on one side, geometric shape on the
-  // other. Axes are seriated by coupling value (strongly-coupled ones adjacent),
-  // so the matrix reads sorted. Click a cell to open that pair as an exact Facet. The lower plot
-  // cross-checks the *statistical* dependence (dCor) against the *geometric* facet
-  // structure (1 - boxiness): they should agree, which validates the sampler.
+  // other. Axes are ordered by hierarchical clustering on the coupling values, so
+  // coupled groups read as blocks on the diagonal. Click a cell to open that pair as an exact Facet —
+  // this matrix is the only way into the facet view.
   let {
     dep = null,
-    pairs = [],
     metric = "dcor",
     onpair,
     onmetric,
   }: {
     dep?: Dependence | null;
-    pairs?: ShadowPair[];
     metric?: DependenceMetric;
     onpair?: (x: string, y: string) => void;
     onmetric?: (m: DependenceMetric) => void;
@@ -41,34 +39,10 @@
   // dependence "strength" used for the color ramp / ordering (Pearson uses magnitude)
   const strength = (v: number) => (metric === "pearson" ? Math.abs(v) : v);
 
-  // ---- coupling seriation: order axes so strongly-coupled ones sit adjacent ----
-  // Greedy chain: seed with the strongest-coupled pair, then repeatedly attach the
-  // unused axis most coupled to either end. Keyed on the currently-shown metric, so
-  // the matrix always reads sorted by the coupling value you're looking at.
-  function seriation(D: number[][]): number[] {
-    const n = D.length;
-    if (n < 2) return Array.from({ length: n }, (_, i) => i);
-    let bi = 0, bj = 1, best = -Infinity;
-    for (let i = 0; i < n; i++)
-      for (let j = i + 1; j < n; j++)
-        if (D[i][j] > best) { best = D[i][j]; bi = i; bj = j; }
-    const order = [bi, bj];
-    const used = new Set(order);
-    while (order.length < n) {
-      const head = order[0], tail = order[order.length - 1];
-      let node = -1, sim = -Infinity, atHead = false;
-      for (let k = 0; k < n; k++) {
-        if (used.has(k)) continue;
-        if (D[tail][k] > sim) { sim = D[tail][k]; node = k; atHead = false; }
-        if (D[head][k] > sim) { sim = D[head][k]; node = k; atHead = true; }
-      }
-      if (node < 0) break;
-      used.add(node);
-      if (atHead) order.unshift(node); else order.push(node);
-    }
-    return order;
-  }
-  const order = $derived.by(() => seriation(rawMatrix.map((row) => row.map(strength))));
+  // Axis order: hierarchical clustering on the coupling values (see cluster.ts).
+  // Keyed on the currently-shown metric, so the matrix re-clusters when you switch
+  // dcor/MI/Pearson, and on the enabled axes, so it re-clusters on a toggle.
+  const order = $derived.by(() => clusterOrder(rawMatrix.map((row) => row.map(strength))));
   const axes = $derived(order.map((i) => rawAxes[i]));
   const matrix = $derived.by(() => order.map((i) => order.map((j) => rawMatrix[i][j])));
   const scaleMax = $derived.by(() => {
@@ -78,7 +52,12 @@
         if (i !== j) m = Math.max(m, strength(matrix[i][j]));
     return m || 1;
   });
-  const fmt = (v: number) => (Math.abs(v) >= 0.995 ? "1" : v.toFixed(2).replace(/^0/, "").replace(/^-0/, "-"));
+  // Keep the sign at the top of the range: with Pearson selected, -0.997 must not
+  // print as "1" (a perfect trade-off read as a perfect co-movement).
+  const fmt = (v: number) =>
+    Math.abs(v) >= 0.995
+      ? (v < 0 ? "-1" : "1")
+      : v.toFixed(2).replace(/^0/, "").replace(/^-0/, "-");
 
   let hover = $state<{ i: number; j: number } | null>(null);
 
@@ -113,27 +92,6 @@
       }
   });
 
-  // ---- validation scatter: dCor (statistical) vs 1 - boxiness (geometric) ----
-  const boxMap = $derived.by(() => {
-    const m = new Map<string, number>();
-    for (const p of pairs) if (p.boxiness != null) m.set(`${p.x}|${p.y}`, p.boxiness);
-    return m;
-  });
-  const valPts = $derived.by(() => {
-    if (!dep) return [] as { dcor: number; interest: number; x: string; y: string }[];
-    const out: { dcor: number; interest: number; x: string; y: string }[] = [];
-    // uses rawAxes/dep.dcor (canonical order) — the scatter is order-independent
-    for (let i = 0; i < rawAxes.length; i++)
-      for (let j = i + 1; j < rawAxes.length; j++) {
-        const b = boxMap.get(`${rawAxes[i]}|${rawAxes[j]}`) ?? boxMap.get(`${rawAxes[j]}|${rawAxes[i]}`);
-        if (b == null) continue;
-        out.push({ dcor: dep.dcor[i][j], interest: 1 - b, x: rawAxes[i], y: rawAxes[j] });
-      }
-    return out;
-  });
-  const VW = 230, VH = 150, VM = { l: 34, r: 10, t: 10, b: 26 };
-  const vx = (d: number) => VM.l + d * (VW - VM.l - VM.r) / 0.6;          // dcor 0..0.6
-  const vy = (d: number) => VH - VM.b - d * (VH - VM.t - VM.b) / 1.0;     // interest 0..1
 </script>
 
 <div class="dep">
@@ -189,7 +147,7 @@
           <strong>{short(axes[hover.i])} × {short(axes[hover.j])}</strong> ·
           {LABELS[metric]} = {matrix[hover.i][hover.j].toFixed(3)} · click → open facet
         {:else}
-          sorted by coupling · lower-left = dependence value · upper-right = exact 2-D facet outline · click any cell to open it · n = {dep.n} samples
+          clustered by coupling · lower-left = dependence value · upper-right = exact 2-D facet outline · click any cell to open it · n = {dep.n} samples
         {/if}
       </p>
     {:else}
@@ -203,28 +161,12 @@
       <div class="ramp"></div>
       <div class="ramp-labels"><span>0</span><span>{scaleMax.toFixed(2)}</span></div>
     </div>
-
-    <div class="validation">
-      <span class="muted small">statistical vs geometric</span>
-      <svg viewBox="0 0 {VW} {VH}">
-        <line x1={VM.l} y1={VH - VM.b} x2={VW - VM.r} y2={VH - VM.b} class="ax" />
-        <line x1={VM.l} y1={VM.t} x2={VM.l} y2={VH - VM.b} class="ax" />
-        {#each valPts as p}
-          <circle cx={vx(p.dcor)} cy={vy(p.interest)} r="3" class="vdot">
-            <title>{short(p.x)} × {short(p.y)} · dCor {p.dcor.toFixed(2)} · interest {(p.interest * 100).toFixed(0)}%</title>
-          </circle>
-        {/each}
-        <text class="vax" x={(VM.l + VW - VM.r) / 2} y={VH - 4} text-anchor="middle">distance correlation →</text>
-        <text class="vax" transform="rotate(-90 10 {(VM.t + VH - VM.b) / 2})" x="10" y={(VM.t + VH - VM.b) / 2} text-anchor="middle">1 − boxiness →</text>
-      </svg>
-      <p class="muted small">Each dot is an axis pair. Agreement (up-right trend) means the
-        sampled cloud's dependence matches the polytope's exact facet structure.</p>
-    </div>
   </aside>
 </div>
 
 <style>
-  .dep { display: grid; grid-template-columns: 1fr 250px; gap: 16px; width: 100%; height: 100%; min-height: 0; padding: 4px; }
+  /* the side rail only carries the color legend now */
+  .dep { display: grid; grid-template-columns: 1fr 110px; gap: 16px; width: 100%; height: 100%; min-height: 0; padding: 4px; }
   .grid-wrap { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 12px; }
   .title { font-size: 13px; color: var(--fg); }
@@ -253,10 +195,6 @@
     background: linear-gradient(to right, #440154, #3b528b, #21918c, #5ec962, #fde725);
   }
   .ramp-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); }
-  .validation svg { width: 100%; height: auto; }
-  .ax { stroke: rgba(255, 255, 255, 0.18); }
-  .vdot { fill: var(--accent); fill-opacity: 0.75; }
-  .vax { fill: var(--muted); font-size: 10px; }
   .muted { color: var(--muted); }
   .small { font-size: 11px; }
 </style>

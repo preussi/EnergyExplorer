@@ -13,6 +13,10 @@ COPY app ./app
 COPY data ./data
 
 ENV DATA_DIR=/app/data
+# Per-user dataset sessions (a few KB each: the recipe to regenerate the cloud,
+# plus the polytope itself for uploads). Mount this to keep sessions across
+# container rebuilds — without a mount they live only as long as the container.
+ENV SESSION_DIR=/app/sessions
 
 EXPOSE 8000
 
