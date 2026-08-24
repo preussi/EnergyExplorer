@@ -58,8 +58,9 @@ be copy-pasted and drifted. **Grep for a stale `var(--…)` after changing these
 `calc()` naming a dropped property silently voids the whole declaration.
 
 - **`ParallelCoords` is ROTATED**: each axis is a horizontal **row**, not a vertical
-  column, so it fits the rail. `scales[a]` maps value → **x**; `yPos[a]` is the row
-  centre; `rowH` is the pitch. A design is still one polyline, running top-to-bottom.
+  column, so it fits the rail. `scales[a]` maps value → **x**; `yPos[a]` is the
+  BAND centre (not the slot centre — the numbers sit below it), `rowHalf` the
+  band's half-thickness and `rowH` the pitch. A design is still one polyline, running top-to-bottom.
   Brushing drags **sideways**; `nearestAxis` matches on **clientY**. If you touch the
   drawing code, remember violin density is thickness in **y** and extent in **x**.
 - **Profiles rail** (`.pc-panel`): `.pc-head` · `.pc-bar` (the typed-limit entry,
@@ -74,16 +75,35 @@ be copy-pasted and drifted. **Grep for a stale `var(--…)` after changing these
 - **Don't re-add a constraint chip list or a per-lever "forced/capped" list.** Both
   existed and both were deleted as duplicates: a constraint is already legible on
   its row (amber band, brush rect, "% left"), and in a rail they truncated.
-- **The rail's fixed heights are load-bearing, and so is `halfOf`'s cap.**
+- **The rail's fixed heights are load-bearing.**
   `.pc-head` / `.vol-slot` / `.lim-slot` / `.pc-key` are all `flex: none` with a
   FIXED height so that constraining something cannot steal height from `.pc-body` —
   that would resize the canvas and re-pitch every violin mid-drag. (Verified:
   `.pc-body` is the same height idle and constrained.) The corollary is that those
   slots are reserved space, so keep them as small as their content allows.
-  Separately, `ParallelCoords.halfOf` caps the row half-thickness: at 13 a 9-axis
-  rail drew ~43 px of ink into a ~76 px pitch and the panel read as mostly empty.
-  It is 22 now. If you change it, move the min/max numbers with it — they sit at
-  `y + half + 13`, and at the old `+ 3` they land *inside* the flex band.
+- **A row is a BLOCK — band + its own min/max/unit line — and the rows are PACKED,
+  not centred in an even slot.** `buildLayout` gives every row `2·half + NUM_ZONE`
+  and turns the leftover into the gaps *between* rows (the last row needs no
+  trailing gap), so `half` is whatever the panel height has left:
+  `half = clamp((avail − n·NUM_ZONE − (n−1)·ROW_GAP) / 2n, 5, 34)` and the pitch
+  `rh` then lands the bottom row's numbers exactly on the bottom margin. The old
+  even-slot version left ~20 px of dead rail under the last violin and drew each
+  band as a thin ribbon adrift in its slot; a flat cap of 22 wasted the rest on a
+  tall window (a 9-axis rail at 806 px now draws a 59 px band, not 44). The floor
+  of 5 is where a violin stops being a shape, and is what sets `MAX_AXES`; past it
+  the pitch just crowds rather than overflowing.
+- **The min/max numbers sit UNDER their own band, and only the spacing says so.**
+  They are `NUM_GAP` px below their band (`numY = y + half + BAND_PAD + NUM_GAP`)
+  and a whole `ROW_GAP` above the next one — that asymmetry is the entire cue for
+  which row a "12.4 GW" belongs to, which is why every leftover pixel goes into the
+  between-row gap and never under a band. They were tried ABOVE the row (on the
+  axis-name baseline) and equidistant between two rows; both made ownership
+  genuinely ambiguous. The unit rides on the max only. Keep `NUM_GAP` well under
+  `ROW_GAP`, and keep `numY` clear of `BAND_PAD` — the flex band overshoots the
+  violin by that much, so a smaller offset lands the numbers *inside* it.
+- **The label gutter is CENTRED on the band** (name at `y − 1`, "% left" at
+  `y + 10`), so it reads as belonging to the band beside it rather than to the
+  clear air above it.
 - **The per-lever consequences sit directly under the rows, above the key.** They
   used to be at the very bottom, below a static legend, which buried the one block
   in the rail that responds to what you just did. The idle text was also deleted:
@@ -141,6 +161,16 @@ be copy-pasted and drifted. **Grep for a stale `var(--…)` after changing these
     the brushed conditional one, so both come from the same distribution. `selected`
     still indexes the base cloud and still drives the polylines and the count —
     don't reuse it to index the projected sample, they are different row sets.
+  - **Clear `marginals` when the axis set changes.** `pcMarginals` maps by axis
+    NAME, so after hiding one *more* axis the previous sample still has every
+    column it asks for and renders happily — a projection onto the WRONG axis set,
+    shown as if it were the answer for the several seconds the refetch takes.
+    Falling back to the full-space marginal meanwhile is at least a real
+    distribution, and the header says it is recomputing.
+  - The wait is visible: an accent "recomputing distributions" tag with a pulsing
+    dot (stilled by *Reduce motion*) in the Profiles header, and the violins dim
+    to 45% while in flight. It is a server round-trip of a few seconds, so a
+    silent stale-looking rail reads as a bug.
   - With every axis shown `π_S(P) = P`, so the frontend skips the request entirely
     and the base cloud is used. On a failed fetch it falls back to A and **says so**
     in the Profiles header — a silent fallback here draws a different distribution
@@ -358,6 +388,14 @@ PVC anymore (PCA is live).
   up -d <svc>`; "my changes vanished" = stale image.
 - **Vite proxy targets `127.0.0.1`, not `localhost`** (Node ≥17 IPv6 `::1` vs
   IPv4-only uvicorn).
+- **The `data-theme` write MUST be an `$effect.pre`.** Canvases read their colours
+  off the live CSS variables (`canvasTokens()`) and their render effects also
+  depend on `theme`. Svelte does not order sibling effects, so with a plain
+  `$effect` the canvas could repaint *before* `<html data-theme>` was updated,
+  baking the previous theme's values in with nothing left to re-trigger it — the
+  rail sat exactly one theme behind until you happened to brush it. Pre-effects
+  run before every render effect in the flush. Measured: the baked amber now
+  matches the theme immediately instead of inverting.
 - **Svelte 5 `$effect`**: never write state an effect also reads (infinite loop).
   Layout effects write scales; render effects only read.
 - **regl-scatterplot**: color value in the 3rd tuple slot (`valueA`), normalized
@@ -564,6 +602,17 @@ cap** — every 4th candidate failed the normal-vision floor — so `band`/`lock
 share the neutral fill and are told apart by a dashed outline plus their label.
 Identity is never colour-alone: the mini outline *is* the shape, the legend is
 always present, and the caption spells out the sentence.
+
+**All six categories get a legend key** (`facets.ts:CATEGORIES`); the two `DASHED`
+ones appear only when the current threshold actually produces them, so v13 — where
+neither ever occurs — is unchanged. They used to be collapsed into a non-clickable
+`+ N band/locked` overflow label, which was fine while they never happened and
+badly wrong once they did: on the Riverside demo the **two most strongly coupled
+pairs in the whole matrix** (dCor 0.91 and 0.90) are bands, and because the legend
+keys are also the category *filters*, they were the only pairs you could not
+isolate. Don't re-collapse them. The key's swatch is dashed to match
+`.facet-mini.dashed`, and the `i` explainer lists all six, because the taxonomy is
+complete — four labels describe a different taxonomy than the matrix draws.
 
 ## Optimum: `z_star`, not `u_star` (data issue RESOLVED)
 

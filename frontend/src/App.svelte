@@ -677,7 +677,7 @@
       target: '[data-tour="pcoords"]',
       title: "Every lever at once",
       body: [
-        "Each horizontal row is one technology; the violin is how the designs are distributed along it, and the numbers at each end are its exact feasible range.",
+        "Each horizontal row is one technology; the violin is how the designs are distributed along it, and the numbers tucked under its two ends are its exact feasible range.",
         "Drag sideways along any row to keep only the designs in that band — that is how you pose a question. Click a row again to clear it; hover a row for its exact numbers.",
       ],
       setup: "clear",
@@ -696,7 +696,7 @@
       title: "Does anything survive?",
       body: [
         "The verdict on your constraints. Whether any feasible design survives at all is decided by a linear program on the polytope — not by whether sampled designs happened to land there — so it is exact however hard you squeeze.",
-        "There used to be a \"% of the space left\" figure here. It was removed: a single percentage read as a far harder number than a Monte-Carlo volume over a 9-D body can be, and it meant something different depending on which axes you had showing. What this tool tells you about a constraint is now only what it can state exactly — this verdict, and the remaining range on every row.",
+        "Squeeze hard enough and the sampled cloud gets too thin to describe your region honestly. When that happens this strip offers to resample — a fresh run inside your constraints — rather than draw a distribution out of a handful of dots.",
       ],
       setup: "cap-demo",
     },
@@ -704,7 +704,7 @@
       target: '[data-tour="flex"]',
       title: "What it forces",
       body: [
-        "Each axis now carries its exact remaining range: an amber band inside a grey track showing what you started with, the surviving span in numbers below, and how much of the range is left above. This is the interesting part: giving something up does not automatically force anything else.",
+        "Each axis now carries its exact remaining range: an amber band inside a grey track showing what you started with, the surviving span in numbers under the row, and the share of the range still left beside the axis name. This is the interesting part: giving something up does not automatically force anything else.",
         `Look at the amber bands on the other axes. If they still fill their grey tracks, ruling out ${short(demoAxis)} costs you options but forces no other decision — it is a free choice.`,
       ],
       next: "Now try the contrast",
@@ -723,7 +723,7 @@
       title: "Your turn",
       body: [
         "Drag along any row to constrain it; click it again to clear.",
-        "Then read the axes for what is forced, and the strip underneath for how much of the space is left. We have cleared the demo constraint — reopen this guide any time with ? in the top bar.",
+        "Then read the axes for what is forced, and the strip underneath for whether anything survives at all. We have cleared the demo constraint — reopen this guide any time with ? in the top bar.",
       ],
       next: "Explore",
       setup: "clear",
@@ -823,7 +823,15 @@
       t = window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
     theme = t as "dark" | "light";
   });
-  $effect(() => {
+  // $effect.pre, NOT $effect. The canvases read their colours off the live CSS
+  // variables (colors.ts:canvasTokens), and their render effects also depend on
+  // `theme`. Svelte does not order sibling effects, so with a plain $effect the
+  // canvas could repaint BEFORE this one wrote `data-theme` — baking the previous
+  // theme's values in, with nothing left to re-trigger it. The symptom was a rail
+  // stuck exactly one theme behind until you happened to brush it. Pre-effects
+  // run before every render effect in the flush, so the attribute (and hence
+  // getComputedStyle) is always current by the time a canvas reads it.
+  $effect.pre(() => {
     document.documentElement.setAttribute("data-theme", theme);
     setColorTheme(theme);   // ramps + categorical palette follow the theme
     try { localStorage.setItem(THEME_KEY, theme); } catch { /* storage disabled */ }
@@ -1160,6 +1168,13 @@
       marginals = null; marginalBusy = false; marginalFailed = false;
       return;
     }
+    // Drop the previous axis set's sample immediately. `pcMarginals` maps by axis
+    // NAME, so after hiding one more axis the old sample still has every column
+    // it asks for and would render happily — a projection onto the WRONG set of
+    // axes, shown as if it were the answer, for as long as the refetch takes.
+    // Falling back to the full-space marginal meanwhile is at least a real
+    // distribution, and the header says it is being recomputed.
+    marginals = null;
     marginalBusy = true;
     marginalTimer = setTimeout(async () => {
       try {
@@ -1407,7 +1422,7 @@
           </div>
           {#if pairShape?.detail}
             <p class="shape-detail">
-              {pairShape.detail}{#if pairShape.category !== "independent"} · {(pairShape.strength * 100).toFixed(0)}% of the corner is ruled out{/if}
+              {pairShape.detail}{#if pairShape.category !== "independent"}{" · "}{(pairShape.strength * 100).toFixed(0)}% of the corner is ruled out{/if}
             </p>
           {/if}
           {#if dispFields.length}
@@ -1647,7 +1662,11 @@
         <span class="pc-title" title="drag along a row to filter · click it again to clear · hover for its exact range">
           Profiles · {pcFields.length} axes
           {#if inCandidates}<span class="muted">· generated</span>
-          {:else if subsetActive && marginalBusy}<span class="muted">· remeasuring</span>
+          {:else if subsetActive && marginalBusy}
+            <span class="busy-tag" class:still={reduceMotion}
+                  title="the distributions are being re-measured over the {nActive} axes you kept — this runs on the server and takes a few seconds">
+              <span class="busy-dot" aria-hidden="true"></span>recomputing distributions
+            </span>
           {:else if subsetActive && marginalFailed}<span class="muted"
             title="the distribution over the {nActive} shown axes could not be measured, so these are the full-space marginals — the same shape you would see with every axis on">· full-space marginals</span>
           {/if}

@@ -28,8 +28,21 @@ export const GAP_EPS_DEFAULT = 0.15;
 /** A label decided by a gap this close to the threshold could flip; say so. */
 export const BORDERLINE_BAND = 0.08;
 
+/** Legend / reading order. All SIX are listed: the classification is complete
+ *  (which corners of the tight bounding box the facet cannot reach), so a legend
+ *  that names only four is describing a different taxonomy than the matrix draws.
+ *  `band` and `locked` carry no hue of their own — see DASHED. */
 export const CATEGORIES: FacetCategory[] =
-  ["tradeoff", "dependency", "at_least_one", "independent"];
+  ["tradeoff", "dependency", "at_least_one", "independent", "band", "locked"];
+
+/** Told apart by a DASHED outline over the neutral fill rather than by a hue.
+ *  Not an afterthought: the palette caps at three hues (every 4th candidate fails
+ *  the normal-vision floor on the all-pairs check), and `independent` is
+ *  deliberately neutral so that structure is what pops. These two are the
+ *  diagonal cases — LL+UR pins the SUM, UL+LR pins the DIFFERENCE — and on a
+ *  tightly-coupled body they can be the most interesting pairs in the matrix, so
+ *  they get real legend keys and can be isolated like any other category. */
+export const DASHED: FacetCategory[] = ["band", "locked"];
 
 // Validated with the dataviz checker on the ALL-PAIRS pairlist against this app's
 // panel (#141b24) — a matrix puts any two categories side by side, so

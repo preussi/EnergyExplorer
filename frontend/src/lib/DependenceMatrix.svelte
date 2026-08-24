@@ -2,7 +2,7 @@
   import { cellColor, heatGradient } from "./colors";
   import { flipGaps, getShadow, type CornerGaps, type Dependence,
            type DependenceMetric, type FacetCategory, type ShadowPair } from "./api";
-  import { CAT, CATEGORIES, classifyFacet, GAP_EPS_DEFAULT } from "./facets";
+  import { CAT, CATEGORIES, DASHED, classifyFacet, GAP_EPS_DEFAULT } from "./facets";
   import { clusterOrder } from "./cluster";
 
   // Pairwise dependence heatmap over the 9 technology axes. Distance correlation / mutual
@@ -174,7 +174,13 @@
     }
     return c;
   });
-  const rare = $derived((catCounts.band ?? 0) + (catCounts.locked ?? 0) > 0);
+  const isDashed = (c: string) => DASHED.includes(c as never);
+  // The four hued categories always get a key (the taxonomy should be legible
+  // even where a category happens not to occur); the two dashed ones appear only
+  // when the current threshold actually produces them, so v13 — where neither
+  // ever occurs — keeps the legend it had.
+  const shownCats = $derived(
+    CAT_ORDER.filter((c) => !isDashed(c) || (catCounts[c] ?? 0) > 0));
 
   // click a legend chip to isolate that category; click again to clear
   let focusCat = $state<FacetCategory | null>(null);
@@ -186,6 +192,9 @@
     dependency:   "M2,22 L2,2 L22,2 L22,12 L12,22 Z",
     at_least_one: "M2,12 L2,2 L22,2 L22,22 L12,22 Z",
     independent:  "M2,22 L2,2 L22,2 L22,22 Z",
+    // the diagonals: band cuts LL+UR (sum pinned), locked cuts UL+LR (difference)
+    band:         "M2,2 L12,2 L22,12 L22,22 L12,22 L2,12 Z",
+    locked:       "M12,2 L22,2 L22,12 L12,22 L2,22 L2,12 Z",
   };
 </script>
 
@@ -273,19 +282,15 @@
       </p>
       {#if showShapes}
       <div class="shape-key" role="group" aria-label="facet shape categories">
-        {#each CAT_ORDER as c}
+        {#each shownCats as c}
           <button class="key" class:on={focusCat === c} class:off={focusCat !== null && focusCat !== c}
                   title="{CAT[c].hint} — click to isolate"
                   onclick={() => (focusCat = focusCat === c ? null : c)}>
-            <span class="sw" style="background:{CAT[c].color}33; border-color:{CAT[c].color}"></span>
+            <span class="sw" class:dashed={isDashed(c)}
+                  style="background:{CAT[c].color}33; border-color:{CAT[c].color}"></span>
             {CAT[c].label}<span class="key-n">{catCounts[c] ?? 0}</span>
           </button>
         {/each}
-        {#if rare}
-          <span class="key-lead" title="substitute one-for-one, or must move together — drawn dashed">
-            + {(catCounts.band ?? 0) + (catCounts.locked ?? 0)} band/locked
-          </span>
-        {/if}
       </div>
       {/if}
 
@@ -302,14 +307,15 @@
             A facet is a projection of a convex body, so it is always convex and always
             touches all four sides of its own bounding box. The only thing left to vary
             is <strong>which corners it cannot reach</strong> — which is what these
-            four labels name. The number beside each is how far, as a share of both
+            six labels name, and why there are exactly six. The number beside each is how far, as a share of both
             ranges at once, you must move off that corner to reach a feasible design.
           </p>
           {#each CAT_ORDER as c}
             <div class="ex-row">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="2" y="2" width="20" height="20" rx="1" class="ex-box" />
-                <path d={DIAGRAM[c]} fill="{CAT[c].color}33" stroke={CAT[c].color} />
+                <path d={DIAGRAM[c]} fill="{CAT[c].color}33" stroke={CAT[c].color}
+                      stroke-dasharray={isDashed(c) ? "3 2" : "none"} />
               </svg>
               <div>
                 <span style="color:{CAT[c].color}">{CAT[c].label}</span>
@@ -369,7 +375,6 @@
     display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
     margin-top: 6px; font-size: 10.5px;
   }
-  .key-lead { color: var(--muted); }
   .hint-lead { color: var(--muted); }
   .key {
     display: inline-flex; align-items: center; gap: 5px;
@@ -381,6 +386,8 @@
   .key.off { opacity: 0.45; }
   .sw { width: 10px; height: 10px; border-radius: 3px; border: 1px solid; flex: none; }
   .key-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  /* mirrors .facet-mini.dashed — the swatch must look like the mark it explains */
+  .sw.dashed { border-style: dashed; }
   .info.sm { vertical-align: middle; margin-right: 4px; }
   .info {
     width: 15px; height: 15px; flex: none; padding: 0; border-radius: 50%;

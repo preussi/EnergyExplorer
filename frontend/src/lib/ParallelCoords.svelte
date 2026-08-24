@@ -109,9 +109,12 @@
   // ROTATED parallel coordinates: each axis is a horizontal ROW, not a vertical
   // column, so the whole plot fits a narrow side rail. A design is still one
   // polyline, but it runs top-to-bottom, its x on each row being its value there.
-  // Consequence throughout: scales map value → X, and yPos[a] is the row centre.
-  // `left` is the label gutter; `bottom` leaves room for the last row's ticks.
-  const M = { top: 10, right: 14, bottom: 14, left: 62 };
+  // Consequence throughout: scales map value → X, and yPos[a] is the BAND centre
+  // (the row's numbers sit below it, so it is not the centre of the row's slot).
+  // `left` is the label gutter. The clear air that separates one row from the
+  // next lives INSIDE the row slot (see buildLayout), so the outer margins only
+  // have to keep the first band and the last number line off the edges.
+  const M = { top: 8, right: 14, bottom: 6, left: 62 };
 
   // Axis-name lookups for the flex decorations, so the render loops stop doing a
   // linear `find` per axis per frame.
@@ -135,25 +138,42 @@
   // Reactive state consumed by the SVG overlay.
   let W = $state(0), H = $state(0);
   let scales = $state<ScaleLinear<number, number>[]>([]);
-  let yPos = $state<number[]>([]);   // row centre per axis
-  let rowH = $state(0);              // vertical pitch between rows
+  let yPos = $state<number[]>([]);   // band centre per axis
+  let rowH = $state(0);              // vertical pitch between row slots
+  let rowHalf = $state(0);           // half-thickness of a row's violin
   let brushes = $state<([number, number] | null)[]>([]);
 
-  type Layout = { sc: ScaleLinear<number, number>[]; yp: number[]; rh: number };
+  type Layout = { sc: ScaleLinear<number, number>[]; yp: number[]; rh: number; half: number };
 
-  // half-thickness of a row's violin / flex band, capped so rows never merge and
-  // the tick line under each row stays clear of the next one
-  // Half-thickness of a row's violin / flex band. The CAP is what decides how full
-  // the rail looks: at 13 a 9-axis rail drew ~43 px of ink into a ~76 px pitch, so
-  // the panel read as mostly empty space with thin ribbons in it. 22 uses ~61 px of
-  // the same pitch and still leaves a clear gutter between rows. The floor of 5 is
-  // the point where a violin stops being a shape, and is what sets MAX_AXES.
-  const halfOf = (rh: number) => Math.max(5, Math.min(22, rh * 0.34));
+  // A ROW is one block: the band (2·half) with its min/max/unit line tucked
+  // directly under it. The numbers belong to the band ABOVE them, and the only
+  // thing that says so is the spacing — they sit NUM_GAP px under their own band
+  // and a whole ROW_GAP away from the next one, so keep the two far apart. (They
+  // were centred between two rows once; nobody could tell whose "GW" it was.)
+  const BAND_PAD = 4;        // the flex band overshoots the violin by this much
+  const NUM_GAP = 2;         // band edge → numbers
+  const NUM_H = 9;           // the number line itself
+  const NUM_ZONE = BAND_PAD + NUM_GAP + NUM_H;
+  const ROW_GAP = 16;        // clear air between one row's numbers and the next band
+  const HALF_MAX = 34, HALF_MIN = 5;
 
+  // Rows are PACKED, not centred in an even slot: each one takes 2·half plus its
+  // number line, the leftover becomes the gaps between them, and the last row
+  // needs no trailing gap. Centring left ~20 px of dead rail under the bottom
+  // violin and made every row look like a thin ribbon adrift in its slot. `half`
+  // is therefore whatever the height has left after the numbers and the gaps —
+  // capped at HALF_MAX so 3 axes don't draw slabs, floored at HALF_MIN, the point
+  // where a violin stops being a shape (which is what sets MAX_AXES).
   function buildLayout(w: number, h: number): Layout {
     const n = fields.length;
-    const rh = (h - M.top - M.bottom) / Math.max(1, n);
-    const yp = fields.map((_, i) => M.top + (i + 0.5) * rh);
+    const avail = h - M.top - M.bottom;
+    const half = Math.max(HALF_MIN, Math.min(HALF_MAX,
+      (avail - n * NUM_ZONE - (n - 1) * ROW_GAP) / (2 * n)));
+    // pitch that lands the LAST row's numbers exactly on the bottom margin; wider
+    // than 2·half + NUM_ZONE + ROW_GAP when the cap binds, narrower (crowded, but
+    // never overflowing) when the floor does.
+    const rh = n > 1 ? (avail - 2 * half - NUM_ZONE) / (n - 1) : 0;
+    const yp = fields.map((_, i) => M.top + i * rh + half);
     const sc = fields.map((_, a) => {
       let lo = Infinity, hi = -Infinity;
       for (let r = 0; r < values.length; r++) {
@@ -181,7 +201,7 @@
       if (lo === hi) hi = lo + 1;
       return scaleLinear().domain([lo, hi]).range([M.left, w - M.right]);
     });
-    return { sc, yp, rh };
+    return { sc, yp, rh, half };
   }
 
   function setupCanvas(c: HTMLCanvasElement, w: number, h: number) {
@@ -245,8 +265,10 @@
     const y = clientY - container.getBoundingClientRect().top;
     let best = 0, bd = Infinity;
     yPos.forEach((py, i) => { const d = Math.abs(py - y); if (d < bd) { bd = d; best = i; } });
-    // half the row pitch, so every pixel of the plot belongs to exactly one row
-    return bd <= Math.max(12, rowH * 0.5) ? best : -1;
+    // half the pitch, so every pixel between two rows belongs to exactly one of
+    // them, but never less than a row's own block (band + its numbers) — the rows
+    // spread far apart when only a few axes are shown
+    return bd <= Math.max(rowHalf + NUM_ZONE, rowH * 0.5) ? best : -1;
   }
   function onDown(e: PointerEvent) {
     const axis = nearestAxis(e.clientY);
@@ -354,11 +376,10 @@
   const VBINS = 44;
   function drawViolins(
     ctx: CanvasRenderingContext2D,
-    sc: ScaleLinear<number, number>[], yp: number[], rh: number,
+    sc: ScaleLinear<number, number>[], yp: number[], halfMax: number,
     rows: number[] | null, fill: string, stroke: string,
     src: number[][] = values,
   ) {
-    const halfMax = halfOf(rh);
     const N = rows ? rows.length : src.length;
     if (!N) return;
     for (let a = 0; a < fields.length; a++) {
@@ -404,11 +425,11 @@
   // the two actually differ, otherwise it is redundant ink on every axis.
   function drawFlexBands(
     ctx: CanvasRenderingContext2D,
-    sc: ScaleLinear<number, number>[], yp: number[], rh: number,
+    sc: ScaleLinear<number, number>[], yp: number[], rowHalf: number,
   ) {
     if (!flexRanges.length && !flexBase.length) return;
     const T = canvasTokens();
-    const half = halfOf(rh) + 4;
+    const half = rowHalf + BAND_PAD;
     ctx.save();
     if (flexBusy) ctx.globalAlpha = 0.55;
     for (let a = 0; a < fields.length; a++) {
@@ -483,20 +504,21 @@
     theme;                                   // repaint when the theme flips
     const T = canvasTokens();
     if (!base || !w || !h || !f.length || !v.length || !de) return;
-    const { sc, yp, rh } = buildLayout(w, h);
+    const { sc, yp, rh, half } = buildLayout(w, h);
     scales = sc;
     yPos = yp;
     rowH = rh;
+    rowHalf = half;
     const ctx = setupCanvas(base, w, h);
     ctx.clearRect(0, 0, w, h);
     if (vi) {
       // exact-range bands behind, then the full-population violin (neutral ghost);
       // the brushed conditional violin is drawn brighter on the highlight layer.
-      if (fr.length || fb.length) drawFlexBands(ctx, sc, yp, rh);
+      if (fr.length || fb.length) drawFlexBands(ctx, sc, yp, half);
       // dimmed while a fresh projection sample is in flight, so a stale
       // distribution never reads as the current one
       if (mb) ctx.globalAlpha = 0.45;
-      drawViolins(ctx, sc, yp, rh, null, T.violinFill, T.violinLine, vsrc);
+      drawViolins(ctx, sc, yp, half, null, T.violinFill, T.violinLine, vsrc);
       ctx.globalAlpha = 1;
     } else {
       // faint neutral context for ALL designs (so a selection reads as "the rest")
@@ -512,7 +534,8 @@
   // hovered pin) is drawn on top as a single bright glowing line.
   // Reads scales/xPos/selected/rowColor/overlay; writes nothing.
   $effect(() => {
-    const sel = selected, w = W, h = H, sc = scales, yp = yPos, rh = rowH, rc = rowColor;
+    const sel = selected, w = W, h = H, sc = scales, yp = yPos, rc = rowColor;
+    const half = rowHalf;
     const ov = overlay, stat = staticLines, vi = showViolins;
     const vsrc = violinSrc, vsel = violinSel;
     theme;                                   // repaint when the theme flips
@@ -527,7 +550,7 @@
       // conditional distribution: the brushed subset as a bright violin on top of
       // the ghost full-population one (answers "if I fix this, what happens?").
       if (vsel && vsel.length)
-        drawViolins(ctx, sc, yp, rh, vsel, T.accent + "4d", T.accent, vsrc);
+        drawViolins(ctx, sc, yp, half, vsel, T.accent + "4d", T.accent, vsrc);
     } else {
       // non-violin mode: color the selection, or the whole set as a vivid overview.
       const rows: Iterable<number> = hasSel ? sel! : values.keys();
@@ -574,37 +597,45 @@
     {#each fields as f, a}
       {#if scales[a] !== undefined && yPos[a] !== undefined}
         {@const y = yPos[a]}
-        {@const half = halfOf(rowH)}
+        {@const half = rowHalf}
+        {@const numY = y + half + BAND_PAD + NUM_GAP}
         {@const cur = flexBy.get(f)}
         {@const p = pctLeft(f)}
         <line class="axis" x1={M.left} y1={y} x2={W - M.right} y2={y} />
 
-        <!-- label gutter (left). Name and the "% left" readout are on separate
-             lines here — stacked on one axis head they collided. -->
-        <text class="axis-name" x={M.left - 8} y={y - 2}>
+        <!-- Label gutter (left): the name and "% left" stack on two lines (on one
+             axis head they collided) and the pair is CENTRED on the band, so the
+             gutter reads as belonging to the band beside it rather than to the
+             clear air above it. -->
+        <text class="axis-name" x={M.left - 8} y={y - 1}>
           {short(f)}<title>{f}{units[f] ? ` · ${shortUnit(units[f])}` : ""} — drag to filter, click to clear</title>
         </text>
         {#if !flexFeasible}
-          <text class="flex-pct bad" x={M.left - 8} y={y + 9}>✕</text>
+          <text class="flex-pct bad" x={M.left - 8} y={y + 11}>✕</text>
         {:else if p != null && p < 99.5}
-          <text class="flex-pct" x={M.left - 8} y={y + 9} class:busy={flexBusy}>
+          <text class="flex-pct" x={M.left - 8} y={y + 10} class:busy={flexBusy}>
             {p < 1 ? p.toFixed(1) : p.toFixed(0)}% left
             <title>{(100 - p).toFixed(0)}% of this lever's near-optimal range is ruled out</title>
           </text>
         {/if}
 
-        <!-- the surviving range in numbers, under the row's two ends -->
+        <!-- The surviving range in numbers, with the unit on the max, tucked
+             UNDER the row's two ends. Ownership comes from the spacing, not from
+             the reading order: they sit NUM_GAP px under their own band and a
+             whole ROW_GAP away from the next one (buildLayout puts every leftover
+             pixel of the slot ABOVE the band to keep it that way). Sitting them
+             equidistant between two rows is what made them ambiguous before. -->
         {#if flexFeasible && cur?.min != null && cur?.max != null}
-          <text class="flex-val start" x={M.left} y={y + half + 13} class:busy={flexBusy}>
+          <text class="flex-val start" x={M.left} y={numY} class:busy={flexBusy}>
             {fmt(cur.min)}
             <title>exact feasible range for {short(f)} under the current constraints (LP, not sample filtering)</title>
           </text>
-          <text class="flex-val end" x={W - M.right} y={y + half + 13} class:busy={flexBusy}>
+          <text class="flex-val end" x={W - M.right} y={numY} class:busy={flexBusy}>
             {fmt(cur.max)}{units[f] ? " " + shortUnit(units[f]) : ""}
           </text>
         {:else}
-          <text class="tick start" x={M.left} y={y + half + 13}>{fmt(scales[a].domain()[0])}</text>
-          <text class="tick end" x={W - M.right} y={y + half + 13}>
+          <text class="tick start" x={M.left} y={numY}>{fmt(scales[a].domain()[0])}</text>
+          <text class="tick end" x={W - M.right} y={numY}>
             {fmt(scales[a].domain()[1])}{units[f] ? " " + shortUnit(units[f]) : ""}
           </text>
         {/if}
@@ -621,9 +652,9 @@
           <rect
             class="brush"
             x={scales[a](brushes[a]![0])}
-            y={y - half - 3}
+            y={y - half - BAND_PAD}
             width={Math.max(2, scales[a](brushes[a]![1]) - scales[a](brushes[a]![0]))}
-            height={half * 2 + 6}
+            height={half * 2 + BAND_PAD * 2}
           />
         {/if}
       {/if}
