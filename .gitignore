@@ -34,3 +34,9 @@ backend/data/polytope_samples_*.npz
 
 # Ad-hoc screenshots (not needed to run the project)
 /Screenshot 2026-06-06 115145.png
+
+# Docs are kept out of the repo. The two markdown files already tracked in here
+# (OPTIMUM_DATA_ISSUE.md, WORKSHOP_DEMO.md) stay versioned — an ignore rule does
+# not untrack what git already follows — but anything NEW under docs/, including
+# generated figures, is local only.
+/docs
