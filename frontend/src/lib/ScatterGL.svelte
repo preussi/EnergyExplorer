@@ -3,7 +3,7 @@
   import createScatterplot from "regl-scatterplot";
   import { scaleLinear } from "d3-scale";
   import { contourDensity } from "d3-contour";
-  import { RAMP, PALETTE } from "./colors";
+  import { palette, ramp, themeToken } from "./colors";
 
   export interface PinMarker {
     id: number;
@@ -37,7 +37,9 @@
     walkActive = false,
     selected = null,
     mode = "pan",
+    inset = null,
     draggableMarkers = false,
+    themeTick = 0,
     onhover,
     onselect,
     onpin,
@@ -62,7 +64,17 @@
     walkActive?: boolean;
     selected?: number[] | null;
     mode?: "pan" | "select";
+    /** Pixels of the canvas that are covered by floating panels. The canvas runs
+     *  edge-to-edge under the top bar and the Profiles rail so there is no seam
+     *  between them, but the DATA must not: without this the cloud centres on the
+     *  full canvas and ~20% of it hides under the rail. Biasing the normalizers
+     *  (rather than nudging the camera) keeps points, contours, pins, overlays and
+     *  the hit-test consistent, since they all go through nx/ny. */
+    inset?: { left: number; top: number; right: number; bottom: number } | null;
     draggableMarkers?: boolean;   // star mode: drag the optimum / pins to rotate the projection
+    /** bumped on a theme change: regl bakes the colour maps at set() time and the
+     *  walk overlay is a canvas, so both must be re-pushed */
+    themeTick?: number;
     onhover?: (index: number | null) => void;
     onselect?: (indices: number[]) => void;
     onpin?: (index: number) => void;
@@ -90,6 +102,15 @@
 
   // data-space normalization (recomputed per dataset)
   const PAD = 0.05;
+  // centre offset + half-span of the visible window, in clip units
+  let cOff: [number, number] = [0, 0];
+  let cSpan: [number, number] = [1, 1];
+  /** [centre, halfSpan] in clip units of the window left after `a`/`b` px are
+   *  covered at the two ends of a `total`-px axis. No cover => [0, 1]. */
+  function clipWindow(a: number, b: number, total: number): [number, number] {
+    if (!total || a + b >= total) return [0, 1];
+    return [(a - b) / total, (total - a - b) / total];
+  }
   let nx = (v: number) => v;
   let ny = (v: number) => v;
   let dataCentroid: [number, number] = [0, 0];
@@ -112,8 +133,18 @@
       minX = Math.min(minX, optimum[0]); maxX = Math.max(maxX, optimum[0]);
       minY = Math.min(minY, optimum[1]); maxY = Math.max(maxY, optimum[1]);
     }
-    nx = (v: number) => (((v - minX) / (maxX - minX || 1)) * 2 - 1) * (1 - PAD);
-    ny = (v: number) => (((v - minY) / (maxY - minY || 1)) * 2 - 1) * (1 - PAD);
+    // Map the data into the VISIBLE sub-rectangle of the canvas rather than the
+    // whole of it (see the `inset` prop). cOff is the visible centre in clip
+    // units, cSpan its half-width; with no inset these are 0 and 1, i.e. exactly
+    // the old behaviour.
+    const [ox, sx] = clipWindow(inset?.left ?? 0, inset?.right ?? 0, container?.clientWidth ?? 0);
+    // y is flipped in clip space: a `top` inset moves the centre DOWN in data
+    // terms, which is -y here.
+    const [oyRaw, sy] = clipWindow(inset?.top ?? 0, inset?.bottom ?? 0, container?.clientHeight ?? 0);
+    const oy = -oyRaw;
+    cOff = [ox, oy]; cSpan = [sx, sy];
+    nx = (v: number) => ox + ((((v - minX) / (maxX - minX || 1)) * 2 - 1) * (1 - PAD)) * sx;
+    ny = (v: number) => oy + ((((v - minY) / (maxY - minY || 1)) * 2 - 1) * (1 - PAD)) * sy;
     dataCentroid = [(minX + maxX) / 2, (minY + maxY) / 2];
     dataSpan = Math.min(maxX - minX, maxY - minY) || 1;
     bx0 = minX; bx1 = maxX; by0 = minY; by1 = maxY;
@@ -125,8 +156,10 @@
     const xs = scatter?.get("xScale");
     const ys = scatter?.get("yScale");
     if (!xs || !ys) return null;
-    const nxInv = (c: number) => bx0 + ((c / (1 - PAD) + 1) / 2) * (bx1 - bx0);
-    const nyInv = (c: number) => by0 + ((c / (1 - PAD) + 1) / 2) * (by1 - by0);
+    const nxInv = (c: number) =>
+      bx0 + ((((c - cOff[0]) / cSpan[0]) / (1 - PAD) + 1) / 2) * (bx1 - bx0);
+    const nyInv = (c: number) =>
+      by0 + ((((c - cOff[1]) / cSpan[1]) / (1 - PAD) + 1) / 2) * (by1 - by0);
     return [(px: number) => nxInv(xs.invert(px)), (py: number) => nyInv(ys.invert(py))];
   }
 
@@ -272,9 +305,9 @@
     }
     await scatter.set({
       colorBy: "valueA",
-      pointColor: categorical ? PALETTE : RAMP,
-      pointColorActive: categorical ? PALETTE : RAMP,
-      pointColorHover: categorical ? PALETTE : RAMP,
+      pointColor: categorical ? palette() : ramp(),
+      pointColorActive: categorical ? palette() : ramp(),
+      pointColorHover: categorical ? palette() : ramp(),
       zDataType: categorical ? "categorical" : "continuous",
     });
     await scatter.draw(buildPoints());
@@ -283,6 +316,32 @@
 
   export function reset() {
     scatter?.reset();
+    applyCameraBounds(); // reset() re-runs initCamera, which can rebuild the camera
+  }
+
+  // ---- keep the camera over the data ----
+  // Points are normalized into clip space [-1,1]·(1-PAD), so the cloud always
+  // occupies a known box no matter what the projection is. Without bounds you can
+  // pan the cloud off-screen and zoom out until it is a dot, with no way back
+  // except "Reset view".
+  //
+  // regl-scatterplot builds its camera itself and never forwards these, so we
+  // reach through `get("camera")` — the camera object does support them
+  // (dom-2d-camera), it just isn't wired to the scatterplot's options.
+  // scaleBounds: [min, max] zoom factor. 1 = the default framing, so 0.9 allows a
+  // sliver of zoom-out for context and 60 is a deep zoom for dense regions.
+  // translationBounds are in the same clip units as the points.
+  const SCALE_BOUNDS: [number, number] = [0.9, 60];
+  const PAN = 1.15; // a little slack past the cloud so edge points aren't pinned
+  function applyCameraBounds() {
+    const cam = scatter?.get("camera");
+    if (!cam?.setScaleBounds) return;
+    cam.setScaleBounds(SCALE_BOUNDS);
+    // the cloud is centred on cOff now, so the pan box travels with it
+    cam.setTranslationBounds([
+      [-PAN + cOff[0], PAN + cOff[0]],
+      [-PAN + cOff[1], PAN + cOff[1]],
+    ]);
   }
 
   // ---- sampler-walk animation (comet trails along chain order) ----
@@ -304,10 +363,11 @@
     ctx.clearRect(0, 0, container.clientWidth, container.clientHeight);
     if (!walkActive || walkChains < 1 || !points.length) return;
     const [px, py] = scales();
+    const P = palette();
     const len = Math.floor(points.length / walkChains);
     walkPos = (walkPos + 2) % len;
     for (let c = 0; c < walkChains; c++) {
-      ctx.strokeStyle = PALETTE[c % PALETTE.length];
+      ctx.strokeStyle = P[c % P.length];
       const base = c * len;
       for (let k = TRAIL; k >= 1; k--) {
         const i1 = (walkPos - k + len * 4) % len;
@@ -324,7 +384,7 @@
       const h = points[base + ((walkPos % len) + len) % len];
       if (h) {
         ctx.globalAlpha = 0.95;
-        ctx.fillStyle = PALETTE[c % PALETTE.length];
+        ctx.fillStyle = P[c % P.length];
         ctx.beginPath();
         ctx.arc(px(h[0]), py(h[1]), 3.2, 0, 2 * Math.PI);
         ctx.fill();
@@ -347,7 +407,7 @@
       yScale,
       lassoOnLongPress: false,
       opacityInactiveScale: 0.12,
-      lassoColor: "#2dd4bf",
+      lassoColor: themeToken("--accent", "#2dd4bf"),
     });
     scatter.subscribe("pointOver", (i: number) => onhover?.(i));
     scatter.subscribe("pointOut", () => onhover?.(null));
@@ -363,6 +423,7 @@
     });
     scatter.subscribe("deselect", () => onselect?.([]));
     scatter.set({ mouseMode: mode === "select" ? "lasso" : "panZoom" });
+    applyCameraBounds();
     sizeWalkCanvas();
     // contours are NOT computed here: redraw() sets up the nx/ny normalizers
     // asynchronously, and the data $effect schedules a (debounced) contour pass
@@ -370,6 +431,11 @@
 
     const ro = new ResizeObserver(() => {
       sizeWalkCanvas();
+      // the normalizers are a function of the container size once `inset` is in
+      // play (the visible window is a fraction of the canvas), so a resize has to
+      // recompute them — repositioning the overlays alone would leave the points
+      // mapped for the old width
+      redraw();
       requestAnimationFrame(positionOverlays);
     });
     ro.observe(container);
@@ -384,7 +450,7 @@
   // updates (star-anchor drags, tours) KDE on 20k points per frame would stall.
   let contourTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
-    points; color; categorical; optimum;
+    points; color; categorical; optimum; inset;
     if (!scatter) return;
     redraw();
     contourTimer = setTimeout(computeContours, 220);
@@ -406,6 +472,15 @@
     if (selected && selected.length) scatter.select(selected, { preventEvent: true });
     else scatter.deselect({ preventEvent: true });
   });
+  // theme flip: regl bakes the colour maps at set() time and the walk trail is a
+  // canvas, so neither follows CSS — both have to be pushed again.
+  $effect(() => {
+    themeTick;
+    if (!scatter) return;
+    scatter.set({ lassoColor: themeToken("--accent", "#2dd4bf") });
+    redraw();
+  });
+
   // pan vs lasso mode
   $effect(() => {
     scatter?.set({ mouseMode: mode === "select" ? "lasso" : "panZoom" });
@@ -509,24 +584,24 @@
     pointer-events: none; overflow: visible;
   }
   .contour { fill: none; stroke: var(--accent); stroke-width: 1; }
-  .spoke-line { stroke: rgba(255, 255, 255, 0.16); stroke-dasharray: 3 4; }
+  .spoke-line { stroke: var(--b-20); stroke-dasharray: 3 4; }
   .spoke-dot {
-    fill: #0d1117; stroke: var(--accent); stroke-width: 1.6;
+    fill: var(--marker-fill); stroke: var(--accent); stroke-width: 1.6;
     pointer-events: all; cursor: pointer;
   }
   .spoke-dot:hover { fill: var(--accent); }
-  .arrow { stroke: #f2c52e; stroke-width: 1.4; stroke-opacity: 0.85; }
+  .arrow { stroke: var(--extreme); stroke-width: 1.4; stroke-opacity: 0.85; }
   .arrow-label {
-    fill: #f2c52e; font-size: 11px; font-weight: 600;
-    paint-order: stroke; stroke: rgba(0, 0, 0, 0.85); stroke-width: 3px;
+    fill: var(--extreme); font-size: 11px; font-weight: 600;
+    paint-order: stroke; stroke: var(--halo); stroke-width: 3px;
   }
   .path-line {
-    stroke: #fff; stroke-width: 1.6; stroke-dasharray: 6 5;
-    filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.6));
+    filter: drop-shadow(0 0 4px var(--tick));
+    stroke: var(--tick); stroke-width: 1.6; stroke-dasharray: 6 5;
   }
   .path-marker {
-    fill: #fff; stroke: rgba(0, 0, 0, 0.6); stroke-width: 1.5;
-    filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.9));
+    filter: drop-shadow(0 0 6px var(--tick));
+    fill: var(--tick); stroke: var(--halo); stroke-width: 1.5;
   }
 
   .cluster {
@@ -536,38 +611,40 @@
   }
   .cluster .dot {
     width: 7px; height: 7px; border-radius: 50%;
-    background: rgba(255, 255, 255, 0.9);
-    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55), 0 0 8px rgba(45, 212, 191, 0.6);
+    background: var(--tick);
+    box-shadow: 0 0 0 2px var(--halo), 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
     flex: none;
   }
+  /* Same readability problem as the hover tooltip: --panel-glass is 72/88%, and
+     a dense point cloud read straight through the label sitting on it. Solid
+     panel + blur, so the words win over the data behind them. */
   .cluster .clabel {
-    font-size: 11px; font-weight: 600; color: #eef4f2;
-    background: rgba(10, 14, 20, 0.7);
-    border: 1px solid rgba(45, 212, 191, 0.35);
+    font-size: 11px; font-weight: 600; color: var(--fg);
+    background: var(--panel-solid);
+    backdrop-filter: blur(3px);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
     border-radius: 6px; padding: 1px 6px;
-    backdrop-filter: blur(2px);
-    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
   }
 
   .pin {
     position: absolute; transform: translate(-50%, -50%);
     width: 19px; height: 19px; border-radius: 50%;
     background: var(--pc);
-    color: #0a0e14; font-size: 11px; font-weight: 800; line-height: 19px;
+    color: var(--on-accent); font-size: 11px; font-weight: 800; line-height: 19px;
     text-align: center;
-    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55), 0 0 10px var(--pc);
+    box-shadow: 0 0 0 2px var(--halo), 0 0 10px var(--pc);
     pointer-events: none;
   }
 
   .optimum {
     position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px;
-    border: 2.5px solid #fff; border-radius: 50%;
-    box-shadow: 0 0 0 1.5px #000, 0 0 6px rgba(0, 0, 0, 0.7);
+    border: 2.5px solid var(--tick); border-radius: 50%;
+    box-shadow: 0 0 0 1.5px var(--halo), 0 0 6px var(--halo);
     pointer-events: none;
   }
   .optimum::after {
     content: ""; position: absolute; inset: 5px;
-    background: #fff; border-radius: 50%;
+    background: var(--tick); border-radius: 50%;
   }
   .pin.draggable, .optimum.draggable {
     pointer-events: auto; cursor: grab; touch-action: none;

@@ -44,9 +44,9 @@ Two Docker containers (a third, Postgres, is planned for persistence):
 │ backend (FastAPI + numpy + scikit-learn + scipy)            │
 │   loads the polytope · GENERATES the sample cloud (hit-    │
 │   and-run) at build time · PCA live · clusters · extremes  │
-│   (LP) · shadows / flexibility / volume · generation       │
+│   (LP) · shadows / flexibility / marginals · generation   │
 └──────────────▲────────────────────────────────────────────┘
-               │ read-only volume
+               │ read-only
               data/polytope.npz   (no samples file — generated)
 ```
 
@@ -143,7 +143,7 @@ once at build time (§15) with the landing-page count (default 20k, 1k–100k),
 seeded 42. Because it's a **single chain**, `meta.diagnostics` R̂/ESS are empty —
 these samples are for interactive analytics, not a convergence-certified result;
 `hopsy` remains the rigorous option for final published numbers. Every downstream
-view (projection, dependence, violins, volume) reads this generated cloud.
+view (projection, dependence, violins) reads this generated cloud.
 
 **Starting point / feasibility** — the **Chebyshev center**: the LP
 
@@ -157,6 +157,160 @@ constraint set as infeasible.
 
 The **sampler walk** overlay (§10.5) animates these chains: consecutive thinned
 states drawn as fading comet trails, one color per chain.
+
+## 4b. Measuring how much a constraint restricts the space
+
+There are **two defensible answers**, they disagree, and neither is a special case
+of the other. This section exists so the decision can be revisited with the
+reasoning intact.
+
+**What the app ships (2026-08-23).** The *volume readout was removed entirely* —
+no percentage is shown for either reading (see "Why the readout went away" below).
+What survives of B is the thing it was always better at: the **profile violins are
+now measured in the projection**, so hiding an axis genuinely reshapes them.
+
+### The two readings
+
+Let `P ⊂ ℝⁿ` be the near-optimal body, `S` the enabled (shown) axes, `C` a
+constraint box acting only on axes in `S` (guaranteed: hiding an axis drops its
+constraint, §9 of CLAUDE.md).
+
+    A   "what fraction of DESIGNS survive"
+        R_A = vol_n(P ∩ C) / vol_n(P)
+        estimated by counting the uniform cloud — free, exact in the limit
+
+    B   "what fraction of reachable COMBINATIONS of the shown axes survive"
+        R_B = vol_|S|(π_S(P) ∩ C_S) / vol_|S|(π_S(P))
+        needs a uniform sample of the PROJECTION — LP hit-and-run, ~5.8 ms/sample
+
+Because `C` touches only `S`, projection and intersection commute
+(`π_S(P ∩ C) = π_S(P) ∩ C_S`), which is what makes B well posed.
+
+### The one-line difference
+
+> **A weights a value by *how many ways* it can be realized. B only asks *whether*
+> it can be.**
+
+Everything else follows from that sentence.
+
+### Worked example (checkable by hand)
+
+Two technologies, `P = {x ≥ 0, y ≥ 0, x + y ≤ 1}`. Hide `y`. Constrain `x ≥ 0.5`.
+
+    A:  area(P ∩ C)/area(P) = 0.125 / 0.5      = 25%
+    B:  len([0.5,1]) / len([0,1])              = 50%
+
+At `x = 0.9` there is almost no room left for `y`, so those designs are **rare** —
+A notices, B cannot. Same body, same constraint, factor of two.
+
+### Consequences of choosing B
+
+| | under B |
+|---|---|
+| volume readout | `R_B` — **not monotone** when axes are removed (*removed from the UI*) |
+| violins | uniform-on-projection: density ∝ the (k−1)-D slice — **this is what ships** |
+| ⇒ with k = 1 | `π_i(P)` is just `[min, max]`, so the violin is **flat** |
+| dependence matrix | dCor/MI would change (different measure on the same axes) |
+| facet outlines | **unchanged** — projection composes, `π_ij(π_S(P)) = π_ij(P)` |
+| flexibility bands | **unchanged** — `max{xᵢ : x ∈ π_S(P)} = max{xᵢ : x ∈ P}` |
+| shape categories | unchanged (they derive from the facets) |
+
+**Monotonicity.** A common intuition is that fewer dimensions must retain ≥ volume.
+That is true for *A with dropped constraints* — every sample projects into the
+reduced space so the denominator is fixed at `N`, and dropping a constraint can only
+add survivors. It is **false for B**, because B moves the denominator too. Measured
+on polytope_13, constraining `wind_onshore` (exact k=2 path, no sampling noise):
+
+| constraint | A (full 9-D) | B (projected 2-D) |
+|---|---|---|
+| middle band 40–60% | 26.07% | 22.52% |
+| lower edge 0–20% | 25.72% | 24.85% |
+| **upper edge 80–100%** | **0.34%** | **10.34%** |
+| wide middle 20–80% | 73.95% | 64.81% |
+
+Both directions occur. The upper-edge row is the clearest illustration of the whole
+distinction: high onshore wind is *reachable* but only under a knife-edge
+configuration of the other seven technologies.
+
+### What is actually implemented (2026-08-23)
+
+- `generate.py:projected_marginals` draws a uniform sample of `π_S(P)`, in physical
+  units, restricted to the shown axes. **No projection is ever constructed** —
+  Fourier–Motzkin explodes on this polytope (measured: one axis 219 → ~2k–9.4k rows,
+  two → ~19M, OOM). Instead hit-and-run runs *inside* `π_S(P)` using the original
+  system: from `q` in direction `d` the chord endpoints are
+  `max/min t s.t. A x ≤ b, x_S = q + t·d`, two LPs per step
+  (`generate.py:_projection_chord`).
+- Served by `POST /api/marginals` `{axes, n}`; `n` clamps to 200–4000, default 1500.
+  Cached on `ds.cache["proj_marginals"]` keyed by the **axis set** (order-independent),
+  so toggling an axis back, or merely reordering the rows, is free.
+- **`|S| = n` short-circuits**: `π_S(P) = P`, so the base cloud is returned as-is
+  (capped + seeded at 20k rows for direct API callers). The frontend does not even
+  send the request in that case — it already holds the cloud.
+- **Measured cost** ~3.5 ms/sample: 6.4 s for the default 1500 on a cold axis set,
+  0.02 s cached. The frontend debounces 350 ms and dims the violins while in flight.
+
+**Verification.** For `|S| = 2` the projection *is* the facet shadow we already
+compute, which gives an independent reference: rejection-sampling uniformly inside
+the exact shadow polygon of `photovoltaics × wind_onshore` and comparing marginals,
+
+| | KS vs the exact-polygon reference |
+|---|---|
+| `projected_marginals` (B) | **0.009** / 0.017 — sampling noise at n = 1500 |
+| the full-space cloud (A) | **0.218** / 0.232 |
+
+and every returned point lies inside the exact polygon. So the sampler is uniform
+on `π_S(P)`, and B is a genuinely different distribution from A rather than a
+noisier version of it.
+
+### Why the readout went away
+
+The `R_B` percentage (and the `R_A` one before it) were removed from the UI on
+2026-08-23. The reasoning, which is *not* that the math was wrong:
+
+- A single headline percentage reads as a much harder number than a Monte-Carlo
+  volume ratio over a 9-D polytope can be.
+- The same constraint produced two different percentages depending on which axes
+  happened to be *shown* — a display toggle silently changing a headline figure.
+- `R_B`'s non-monotonicity under hiding an axis (the table above) is correct and
+  almost impossible to explain in a rail with no room for a paragraph.
+
+What the UI says about a constraint is now only what it can state **exactly**: the
+LP feasibility verdict, and the remaining `[min, max]` on every row. The in-region
+sample *count* survives, but only where it is a statement about the cloud rather
+than about the space — deciding whether to offer a resample.
+
+`generate.py:volume_ratio` (subset simulation) and `projected_volume_ratio`, and
+the `POST /api/volume` endpoint, were deleted along with it. §10.12 below is kept
+as a record of the subset-simulation method, which is worth having if the readout
+is ever revived.
+
+### The inconsistency that used to be here
+
+Previously: *the violins showed A while the volume showed B.* Both halves of that
+are now resolved — the volume is gone, and the violins are B. The deferred cost
+(~5.8 ms/sample estimated then; ~3.5 ms/sample measured now) is paid on a debounced,
+cached, per-axis-set basis rather than on every interaction, which is what made it
+affordable.
+
+Measured shape of the change (photovoltaics violin, mass in the outer 20% of the
+range): full-space marginal 24.4% → k=2 projection 34.0% → k=1 uniform 36.4% (flat).
+The k=1 flattening is real and expected: with one axis shown, "the reachable
+combinations" is just the interval, and every value in it is reachable.
+
+**Still A, deliberately:** the dependence matrix (dCor/MI), the facet outlines and
+the flexibility bands. The last two are *invariant* (`π_ij(π_S(P)) = π_ij(P)`, and
+per-axis extents survive projection), so they are not inconsistent at all. The
+matrix is a real remaining asymmetry: making it B would change dCor under a display
+toggle, which is hard to explain and much harder to justify than reshaping a density.
+
+### How to switch the violins back to A
+
+One line: stop passing `marginalValues={pcMarginals}` to `ParallelCoords` in
+`App.svelte`. The component falls back to the base cloud when it is null, which is
+exactly A. (It also falls back on a failed fetch — and says so in the Profiles
+header, because silently drawing a different distribution is the failure mode this
+whole section is about.)
 
 ## 5. Normalized vs physical space
 
@@ -446,7 +600,16 @@ dependence matrices are subset to the enabled axes, and a docked facet whose axi
 gets disabled is closed rather than left captioning a hidden dimension.
 
 ### 10.12 Volume retained (how much of the space survives) — subset simulation
-The Consequences panel answers *"how much smaller does the near-optimal space get
+
+> **REMOVED FROM THE APP (2026-08-23).** Neither this readout nor its projected
+> variant is shown any more, `POST /api/volume` and `generate.py:volume_ratio` are
+> deleted, and the Consequences strip now carries only the exact LP feasibility
+> verdict. See §4b, "Why the readout went away", for the reasoning. The section is
+> kept because the subset-simulation method is the non-obvious part and is worth
+> having written down if the readout is ever revived. What survives in code is the
+> in-region **sample count**, used only to decide whether to offer a resample.
+
+The Consequences panel answered *"how much smaller does the near-optimal space get
 under these constraints?"* as a **relative volume**:
 `vol({Ax≤b} ∩ box) / vol({Ax≤b})`, where the box is the current constraint set
 (manual + brush + slice). Because the samples are **uniform** on the polytope, the
@@ -518,6 +681,157 @@ facet shadows are all filtered/subset at the presentation layer only (the core
   technologies, so honouring a drop would require refitting on the subset (a
   backend recompute we chose not to do); a note in the panel says so.
 
+### 10.14 Guided tour (`Tour.svelte`, **? guide** in the top bar)
+A spotlight walkthrough: four dimmed panels leave a real gap around the element a
+step is describing (rather than an SVG mask), so the highlighted control **stays
+clickable** — the point is to teach the buttons, not to lock the user out. Auto-runs
+once on a first visit (`ee.tourSeen`), reopenable from the top bar.
+
+It teaches a **question**, not a control panel: each step sets the app up for what
+it is about to explain (switches view, opens the wind × wind facet, applies the
+constraint), so the user watches the real views react. The scenario is *"what if we
+build essentially no offshore wind?"* — capping the lever at 5 % of its own
+feasible maximum.
+
+**Why that scenario, and why it has a second half.** Measured on the v13 polytope:
+
+| constraint | space retained | other levers moved | forced (gained a floor) |
+|---|---|---|---|
+| `wind_offshore ≤ 57` (5 %) | 11.7 % | 0 (one changes by <0.05 %) | none |
+| `wind_onshore ≤ 220` (5 %) | 2.5 % | 5 | photovoltaics |
+
+Ruling out offshore wind is a **free choice** here: it costs you 88 % of the design
+space but forces no other decision. Ruling out onshore wind does not — PV picks up
+a floor. A tour that only did the first case would look like the tool does nothing,
+so the walkthrough runs both and the contrast *is* the lesson. This is §10.8's
+"weakly-coupled, corner-trimmed box" showing up in the UI.
+
+The step text never asserts specific numbers (an uploaded polytope will have its
+own), and the axis pair falls back to the first two axes if a dataset has no
+`wind_offshore`/`wind_onshore`. Steps carry an explicit `setup` tag rather than
+deriving behaviour from their title or target — two steps share the flexibility
+panel, and matching on prose breaks the moment the wording or an axis name changes.
+
+## 10b. Facet shape taxonomy (corner gaps)
+
+### Why the classification is complete, not a taste call
+
+A facet `F = π_ij(P)` is an orthogonal projection of a convex body, so it is
+**always convex** — no holes, no reflex vertices, no disconnected pieces. Let `B`
+be its tight bounding box. Each of `x_min, x_max, y_min, y_max` is attained by some
+point of `F`, so **F touches all four sides of B**. The sides therefore carry no
+information, and the only structural freedom left is *which corners of B the facet
+cannot reach*. There are four. That is what makes this taxonomy exhaustive rather
+than a list of shapes someone happened to notice.
+
+### Normalisation
+
+    u = (x − x_min)/(x_max − x_min)      v = (y − y_min)/(y_max − y_min)
+
+maps `F` into the unit square, still touching all four sides. Scale- and unit-free,
+so a GW×GW pair and a GW×ktCO₂/h pair are directly comparable.
+
+### The corner gap
+
+For each corner `c ∈ {(0,0), (1,0), (0,1), (1,1)}`:
+
+    g_c = min ‖p − c‖∞ = min max( |p_u − c_u| , |p_v − c_v| )
+         p ∈ F̂         p ∈ F̂
+
+`g_c ∈ [0,1]`, and `g_c = 0 ⟺ c ∈ F̂` — that pair of extremes is simultaneously
+attainable.
+
+**Why L∞ and not Euclidean.** The L∞ ball around a corner is an axis-aligned
+square, so `g_c` is exactly *the largest t such that no feasible design has both
+coordinates within t of their respective extremes*. That is the decision statement
+verbatim. Euclidean distance blends the two shortfalls into a number with no such
+reading — a point very close in `u` and far in `v` would still score small.
+
+Two identities fall out:
+
+    g_UR = 1 − max min(p_u, p_v)     the highest level BOTH can simultaneously reach
+    g_LL =     min max(p_u, p_v)     the lowest level BOTH can simultaneously be held to
+
+### Computing it exactly
+
+`F̂` is a hull-ordered polygon. Ray-cast to test whether `c` is inside (→ 0);
+otherwise minimise over each edge. Along an edge `t ↦ max(|a+bt|, |d+et|)` is a max
+of two convex functions, hence convex, so **ternary search yields the exact
+minimum** — 80 iterations shrink the bracket by `(2/3)⁸⁰ ≈ 1e-14`. No sampling
+grid, so no resolution artefacts. (`generate.py:corner_gaps`.)
+
+The one approximation is upstream: the polygon is the hull of 72 support-LP
+maximisers, so it is *inscribed* in the true shadow. A vertex whose normal cone is
+narrower than 5° could be clipped, which would slightly **over**state a gap.
+
+### The six categories
+
+With `H = { c : g_c ≥ θ }`:
+
+| H | category | statement |
+|---|---|---|
+| ∅ | `independent` | no corner cut — choose the two separately |
+| ⊇ {LL, UR} | `band` | substitute one-for-one; the total is pinned |
+| ⊇ {UL, LR} | `locked` | must move together |
+| {UR} | `tradeoff` | cannot both be large |
+| {LL} | `at_least_one` | cannot both be small |
+| {LR} or {UL} | `dependency` | **directional** — one at scale requires the other |
+
+**Test order matters**: the diagonal pairs are checked *before* the single corners,
+because a facet cutting both LL and UR is a band, not a trade-off with a footnote.
+
+**Why the diagonals differ.** `{LL, UR}` is the **sum** diagonal — cutting UR bounds
+`x+y` above, cutting LL bounds it below; both ⇒ `x+y` confined ⇒ a diagonal band ⇒
+strict substitution. `{UL, LR}` is the **difference** diagonal — both ⇒ `x−y`
+confined ⇒ lockstep.
+
+### The threshold is a reporting choice, not a noise floor
+
+A corner that is genuinely attained is the maximiser for *every* direction in its
+quadrant, so 72 directions always recover it: `g_c = 0` is exact. The inscribed-hull
+error is bounded by `R(1 − cos(Δθ/2)) ≈ 7e-4` on the unit square. **Numerical noise
+is ~1e-3, not 0.15.** So `θ` answers "how much of a corner must be cut before it is
+worth reporting", and nothing else.
+
+A data-driven `θ` was **tried and rejected**. The largest jump in the sorted
+non-zero gaps on `polytope_13` falls at **0.216**, which reclassifies
+`DAC × biomass` — the only `at_least_one` pair, gap 0.18 — and
+`photovoltaics × biomass` (0.16) as `independent`. The distribution is dominated by
+the 21 trade-offs at 0.25–0.42, so any break-finder tracks *that* cluster and
+swallows the rare categories. Categories are not separable by gap magnitude; only
+materiality is.
+
+Hence: a documented default (`GAP_EPS = 0.15`, clear of the near-box pairs which
+top out at 0.11 and the trade-offs which start at 0.25), **exposed as a slider** so
+the sensitivity is visible, with the continuous gap always shown and threshold-
+sensitive calls marked *borderline*. Sensitivity on v13:
+
+| θ | tradeoff | dependency | at_least_one | independent |
+|---|---|---|---|---|
+| 0.10 | 23 | 5 | 1 | 7 |
+| **0.15** | **21** | **4** | **1** | **10** |
+| 0.20 | 21 | 3 | 0 | 12 |
+| 0.25 | 21 | 2 | 0 | 13 |
+
+### Where it lives
+
+`generate.py` computes the gaps (cached with the shadow) and classifies at the
+default θ for API consumers. The frontend re-classifies from the raw gaps
+(`lib/facets.ts`) so the slider is instant and needs no refetch. **The two
+implementations must agree** — verified across all 36 pairs including the
+directional `needs`, 0 disagreements.
+
+### Result on polytope_13
+
+`21 tradeoff · 10 independent · 4 dependency · 1 at_least_one · 0 band · 0 locked`
+
+Cross-checked against independent LPs: pinning nuclear to its lowest *or* highest
+2% leaves PV's range untouched (a true box); maxing `ccs_lump` lifts biomass's floor
+to 89% of its range; pinning DAC low forces biomass to 61% of its. `band`/`locked`
+are absent because ε = 0.1 is generous and the other seven technologies absorb
+almost any pair you constrain — they are detected so a tighter or uploaded polytope
+is not mislabelled as one of the simple cases.
+
 ## 11. Interaction model
 
 - **Linked selection** — one row-index set drives both views: lasso (Select
@@ -561,7 +875,7 @@ present, and 404 when the id is unknown (§16).
 | `/api/dependence?sampler` | GET | 9×9 distance-correlation, mutual-information & Pearson matrices (cached, 1.5k subsample) |
 | `/api/shadow` | POST | exact 2-D shadow polygon of the (constrained) polytope |
 | `/api/flexibility` | POST | exact remaining [min,max] per axis under constraints |
-| `/api/volume` | POST | relative volume of the constrained region vs the full space (subset-simulation estimate; accurate in the tail) |
+| `/api/marginals` | POST | uniform sample of `π_S(P)` over the shown axes — the distribution the Profiles violins draw (§4b) |
 | `/api/generate` | POST | constraints → feasibility LP → hit-and-run candidates + PCA coords |
 | `/api/datasets` | GET | preloaded polytopes available to build from (`{id, name, n_axes}`) |
 | `/api/build/preloaded` | POST | `{dataset_id, n_samples}` → build a dataset from a shipped polytope: generate the cloud + eagerly warm every cache; returns `/api/meta` **with the new session id** |

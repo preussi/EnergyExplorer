@@ -56,6 +56,14 @@ outside 1k–100k is rejected with 422, not clamped), so there is no large sampl
 file and no precomputed projection cache (PCA is live, t-SNE/UMAP were removed).
 See [PROCESSES.md](PROCESSES.md) §4 & §15.
 
+## Guided tour
+
+First visit opens a **? guide** walkthrough (reopenable from the top bar). It
+spotlights each control while walking one real question end to end — *what if we
+build essentially no offshore wind?* — applying the constraint for you and then
+contrasting it with the same cut on onshore wind. The two cases behave very
+differently, which is the point: see [PROCESSES.md](PROCESSES.md) §10.14.
+
 ## Sessions
 
 Building a dataset creates a **session**, and its id goes into the URL
@@ -78,5 +86,5 @@ to keep them across rebuilds. See [PROCESSES.md](PROCESSES.md) §16.
 | `GET /api/projection?method=pca&dims=2[&sample=N]` | projected points + optimum + loadings |
 | `GET /api/samples?space=phys&fields=nuclear,battery[&sample=N]` | raw values (backs parallel coords) |
 
-The full endpoint list (dependence, shadow, flexibility, volume, extremes,
+The full endpoint list (dependence, shadow, flexibility, marginals, extremes,
 generate, clusters, …) is in [PROCESSES.md](PROCESSES.md) §13.

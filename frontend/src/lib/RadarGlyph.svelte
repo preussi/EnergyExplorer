@@ -57,6 +57,9 @@
 </svg>
 
 <style>
-  .ring { fill: none; stroke: rgba(255, 255, 255, 0.07); }
-  .spoke { stroke: rgba(255, 255, 255, 0.1); }
+  /* --grid, not --s-09: the scrims are SURFACE washes, and at their alpha a
+     hairline on white came out at ~1.08:1, i.e. the whole web vanished in light
+     mode. --grid is the token for chart scaffolding and is tuned per theme. */
+  .ring { fill: none; stroke: var(--grid); }
+  .spoke { stroke: var(--grid); }
 </style>

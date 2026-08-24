@@ -1,10 +1,10 @@
 <script lang="ts">
   import {
     getMeta, getProjection, getColor, getSamples, getClusters, getExtremes, generate,
-    getFlexibility, getVolume, getDependence, getShadowPairs,
+    getFlexibility, getDependence, getShadowPairs, getMarginals,
     type Meta, type Projection, type ColorData, type SamplesData, type ClustersData,
     type GenerateResult, type ConstraintInput, type ExtremeDesign, type FlexRange,
-    type VolumeEstimate, type Dependence, type DependenceMetric, type ShadowPair,
+    type Dependence, type DependenceMetric, type ShadowPair, type Marginals,
     setDatasetId, storedDatasetId, UnknownDataset,
   } from "./lib/api";
   import { onMount } from "svelte";
@@ -15,10 +15,14 @@
   import ParallelCoords from "./lib/ParallelCoords.svelte";
   import RadarGlyph from "./lib/RadarGlyph.svelte";
   import FacetView from "./lib/FacetView.svelte";
-  import FlexBars from "./lib/FlexBars.svelte";
+  import ConsequenceStrip from "./lib/ConsequenceStrip.svelte";
   import StarWheel from "./lib/StarWheel.svelte";
   import DependenceMatrix from "./lib/DependenceMatrix.svelte";
+  import Tour from "./lib/Tour.svelte";
   import { clusterOrder } from "./lib/cluster";
+  import { markGradient, pinColor, PIN_SLOTS, setColorTheme, shortUnit } from "./lib/colors";
+  import { getShadow, type CornerGaps } from "./lib/api";
+  import { CAT, classifyFacet, GAP_EPS_DEFAULT } from "./lib/facets";
 
   let meta = $state<Meta | null>(null);
   let proj = $state<Projection | null>(null);
@@ -232,9 +236,11 @@
     values: number[]; // physical, all 10 axes
     point: [number, number]; // projection coords at pin time
     normTech?: number[]; // normalized tech values (lets star mode re-project live)
-    color: string;
+    /** palette SLOT, not a resolved colour: the pin palette is theme-dependent
+     *  (dark pastels are 1.2-1.6:1 on white), and a colour baked in at pin time
+     *  would keep the old theme's value after a flip. */
+    slot: number;
   }
-  const PIN_COLORS = ["#7adfff", "#ff7ab2", "#ffd47a", "#b4ff7a", "#d49bff", "#ff9b7a"];
   let pins = $state<Pin[]>([]);
   let pinSeq = 0;
   let morphT = $state(0);
@@ -248,10 +254,12 @@
     if (pins.some((p) => p.label === label)) return;
     // Pick the first palette color not already in use, so removing a pin and
     // adding another doesn't collide with a surviving pin's color.
-    const used = new Set(pins.map((p) => p.color));
-    const color = PIN_COLORS.find((c) => !used.has(c)) ?? PIN_COLORS[pins.length % PIN_COLORS.length];
+    const used = new Set(pins.map((p) => p.slot));
+    let slot = 0;
+    while (slot < PIN_SLOTS && used.has(slot)) slot++;
+    if (slot >= PIN_SLOTS) slot = pins.length % PIN_SLOTS;
     pins = [...pins, {
-      id: pinSeq++, label, values, point, normTech: normVals, color,
+      id: pinSeq++, label, values, point, normTech: normVals, slot,
     }];
     morphT = 0;
   }
@@ -275,6 +283,7 @@
     for (let j = 0; j < starAnchors.length; j++) { x += t[j] * starAnchors[j][0]; y += t[j] * starAnchors[j][1]; }
     return [x, y];
   }
+  const pinColors = $derived(pins.map((p) => pinColor(p.slot, theme)));
   const pinPoints = $derived(
     pins.map((p) =>
       isStar && p.normTech && starAnchors.length ? starProject(p.normTech) : p.point,
@@ -308,7 +317,7 @@
   function findSimilar(p: Pin) {
     if (simPin === p.id) { clearSelection(); return; } // clicking again clears it
     if (!dispValues.length || !techRanges.length) return;
-    exitSlice();
+    clearBrushConstraints();
     const tech = dispFields.map((_, j) => j).filter((j) => dispFields[j] !== "net_present_cost");
     const span = tech.map((j) => {
       const rg = techRanges[techIdxOf(j)] ?? { min: 0, max: 1 };
@@ -340,7 +349,9 @@
   function clearSelection() {
     selected = null;
     simPin = null;
-    sliceAxis = null;
+    // clear the constraints here too: clearBrushes only does it via its callback,
+    // which never fires if the parallel coords aren't mounted.
+    clearBrushConstraints();
     pcoords?.clearBrushes();
   }
 
@@ -348,20 +359,16 @@
   let candidates = $state<GenerateResult | null>(null);
   let generating = $state(false);
   let genMsg = $state<string | null>(null);
-  let manualConstraints = $state<ConstraintInput[]>([]);
+  // Constraints come from ONE place: dragging along a row. A separate typed
+  // min/max entry used to exist alongside brushing and the two never composed
+  // legibly — a typed limit and a brush on the same axis both narrowed it with
+  // no way to see which did what. Brushing is the whole vocabulary now.
   let brushConstraints = $state<{ axis: string; min: number; max: number }[]>([]);
   let genN = $state(2000);
-  let newAxis = $state("nuclear");
-  let newMin = $state<number | null>(null);
-  let newMax = $state<number | null>(null);
 
-  const allConstraints = $derived<ConstraintInput[]>([...manualConstraints, ...brushConstraints]);
+  const allConstraints = $derived<ConstraintInput[]>(brushConstraints);
 
-  // slice/sweep state (logic defined below, after dispValues/dispFields exist)
-  let sliceAxis = $state<string | null>(null);
-  let sliceValue = $state(0);
-  let sliceWidth = $state(0.03); // half-band as a fraction of the axis range
-  function exitSlice() { sliceAxis = null; brushConstraints = []; }
+  function clearBrushConstraints() { brushConstraints = []; }
 
   // refresh the exact remaining-flexibility ranges when constraints change.
   // Debounced + sequence-guarded: clearTimeout can't cancel an in-flight fetch,
@@ -386,15 +393,6 @@
     }, 350);
     return () => { if (flexTimer) clearTimeout(flexTimer); };
   });
-
-  function addConstraint() {
-    if (newMin == null && newMax == null) return;
-    manualConstraints = [...manualConstraints, { axis: newAxis, min: newMin, max: newMax }];
-    newMin = null; newMax = null;
-  }
-  function removeConstraint(i: number) {
-    manualConstraints = manualConstraints.filter((_, j) => j !== i);
-  }
 
   async function generateNow() {
     if (!proj) return;
@@ -512,14 +510,13 @@
 
   // (Re)load everything for the currently-active backend dataset. Called once on
   // mount and again after a dataset upload/reset, so it also tears down interaction
-  // state that belonged to the previous dataset (pins, tour, constraints, slice…).
+  // state that belonged to the previous dataset (pins, tour, constraints…).
   async function reloadAll() {
     selected = null; candidates = null; genMsg = null;
     pins = []; stopMorph(); morphT = 0;
     if (touring) toggleTour();
     normTech = null; starAnchors = [];
-    manualConstraints = []; brushConstraints = [];
-    sliceAxis = null; volEstimate = null;
+    brushConstraints = [];
     facetSel = null; couplingPair = null; couplingFull = false;
     shadowPairs = []; depData = null; // force the dependence/shadow-pair effects to refetch
     try {
@@ -529,7 +526,6 @@
       // an uploaded dataset may not carry the previously-selected axis names
       // ("" is the valid no-encoding choice, so leave it alone)
       if (field && !m.axes.includes(field)) field = m.axes[0];
-      if (!m.axes.includes(newAxis)) newAxis = m.axes[0];
       loadProjection(); loadColor(); loadSamples(); loadClusters(); loadExtremes();
       const r = await getFlexibility([]);
       flexBase = r.ranges;
@@ -559,21 +555,29 @@
   }
 
   function onLandingReady(m: Meta) {
+    resumeMeta = null;          // the old session is no longer what we'd go back to
     adoptSession(m);
     meta = m;
     started = true;
     reloadAll();
   }
 
-  // "⟳ change dataset" also drops the session, so the next load lands on the
-  // landing page rather than restoring the dataset we just walked away from.
+  // Going back to the landing page must not destroy the session. It used to call
+  // setDatasetId(null) and clear ?ds= immediately, which made "change dataset" a
+  // ONE-WAY DOOR: the id was the only handle on the built cloud, so backing out
+  // meant regenerating it. Now the id is left alone until a new dataset is
+  // actually built (`adoptSession` overwrites it), and the landing page offers a
+  // way back for as long as `resumeMeta` holds the session we stepped away from.
+  let resumeMeta = $state<Meta | null>(null);
   function changeDataset() {
-    setDatasetId(null);
-    const url = new URL(location.href);
-    url.searchParams.delete("ds");
-    history.replaceState(null, "", url);
-    meta = null;
+    resumeMeta = meta;
     started = false;
+  }
+  function resumeSession() {
+    if (!resumeMeta) return;
+    meta = resumeMeta;
+    resumeMeta = null;
+    started = true;
   }
 
   // Boot: if this browser (or the link that was opened) names a dataset, go
@@ -600,10 +604,235 @@
     }
   });
 
+  // ---- guided tour ----
+  // Walks a concrete question ("what if we build no offshore wind?") rather than
+  // labelling controls in the abstract: each step sets the app up for what it is
+  // about to explain, so the user watches the real views react.
+  let tourOpen = $state(false);
+  let tourStep = $state(0);
+  const TOUR_SEEN = "ee.tourSeen";
+
+  // The scenario needs a lever to rule out and one to contrast it against. Prefer
+  // the wind pair (the interesting case in the shipped polytope: capping offshore
+  // wind forces nothing, capping onshore wind pushes most other levers), but fall
+  // back to whatever axes an uploaded polytope actually has.
+  const demoAxis = $derived(
+    (meta?.axes ?? []).includes("wind_offshore") ? "wind_offshore" : (meta?.axes ?? [])[0] ?? "",
+  );
+  const demoAxis2 = $derived(
+    (meta?.axes ?? []).includes("wind_onshore") ? "wind_onshore"
+      : (meta?.axes ?? []).find((a) => a !== demoAxis) ?? "",
+  );
+  /** cap `axis` at a small share of its own feasible maximum ≈ "essentially none".
+   *  Drives a real brush on the row, so the demo shows the same thing the user
+   *  would do by hand rather than a constraint materialising invisibly. */
+  function capLever(axis: string, share = 0.05) {
+    const r = flexBase.find((f) => f.axis === axis);
+    if (!r || r.max == null || r.min == null) return;
+    pcoords?.setBrush(axis, r.min, +(r.max * share).toPrecision(2));
+  }
+  function clearScenario() {
+    brushConstraints = [];
+    pcoords?.clearBrushes();
+  }
+
+  const tourSteps = $derived([
+    {
+      title: "A space of answers, not one answer",
+      body: [
+        `Every design in here costs within a few % of the cost-optimal system, so none of them is "wrong". The tool is for seeing what that freedom actually buys you.`,
+        `This guide walks one question end to end: what happens if we build essentially no ${short(demoAxis)}?`,
+      ],
+      next: "Start",
+      setup: "reset",
+    },
+    {
+      target: '[data-tour="views"]',
+      title: "Two views",
+      body: [
+        "Coupling shows how the levers constrain each other. Map is a PCA projection of the design cloud.",
+        "The exact trade-off boundaries live inside Coupling — click a cell to open one.",
+      ],
+      setup: "reset",
+    },
+    {
+      target: '[data-tour="matrix"]',
+      title: "Which levers move together",
+      body: [
+        "Rows and columns are technologies, ordered by hierarchical clustering so the strongly-coupled ones sit next to each other.",
+        "Lower-left is the dependence value; upper-right is that pair's exact 2-D boundary. Click any cell to open it full size.",
+      ],
+      setup: "reset",
+    },
+    {
+      target: '[data-tour="full-view"]',
+      title: "The exact trade-off boundary",
+      body: [
+        `This is the true ${short(demoAxis)} × ${short(demoAxis2)} facet. The dots are sampled designs, but the white outline around them is exact — computed by linear programs on the polytope, not traced from the dots.`,
+        "⛶ full view expands it over the matrix; ✕ closes it.",
+      ],
+      setup: "facet",
+    },
+    {
+      target: '[data-tour="pcoords"]',
+      title: "Every lever at once",
+      body: [
+        "Each horizontal row is one technology; the violin is how the designs are distributed along it, and the numbers at each end are its exact feasible range.",
+        "Drag sideways along any row to keep only the designs in that band — that is how you pose a question. Click a row again to clear it; hover a row for its exact numbers.",
+      ],
+      setup: "clear",
+    },
+    {
+      target: '[data-tour="flex"]',
+      title: `Ruling out ${short(demoAxis)}`,
+      body: [
+        `We just brushed it for you: ${short(demoAxis)} held near zero. That teal band on its row is the constraint — drag one yourself on any row, and click a row to clear it.`,
+        "Everything else on screen has already updated to this question.",
+      ],
+      setup: "cap-demo",
+    },
+    {
+      target: '[data-tour="consequences"]',
+      title: "Does anything survive?",
+      body: [
+        "The verdict on your constraints. Whether any feasible design survives at all is decided by a linear program on the polytope — not by whether sampled designs happened to land there — so it is exact however hard you squeeze.",
+        "There used to be a \"% of the space left\" figure here. It was removed: a single percentage read as a far harder number than a Monte-Carlo volume over a 9-D body can be, and it meant something different depending on which axes you had showing. What this tool tells you about a constraint is now only what it can state exactly — this verdict, and the remaining range on every row.",
+      ],
+      setup: "cap-demo",
+    },
+    {
+      target: '[data-tour="flex"]',
+      title: "What it forces",
+      body: [
+        "Each axis now carries its exact remaining range: an amber band inside a grey track showing what you started with, the surviving span in numbers below, and how much of the range is left above. This is the interesting part: giving something up does not automatically force anything else.",
+        `Look at the amber bands on the other axes. If they still fill their grey tracks, ruling out ${short(demoAxis)} costs you options but forces no other decision — it is a free choice.`,
+      ],
+      next: "Now try the contrast",
+      setup: "cap-demo",
+    },
+    {
+      target: '[data-tour="flex"]',
+      title: `…and now without ${short(demoAxis2)}`,
+      body: [
+        `Same question, different lever: we swapped the constraint to ${short(demoAxis2)}.`,
+        "Compare the axes with the previous step. Where an amber band has lifted off the bottom of its grey track, that lever now has a floor — the system has to make up for what you removed. That difference between the two cases is the point of the whole tool.",
+      ],
+      setup: "cap-contrast",
+    },
+    {
+      title: "Your turn",
+      body: [
+        "Drag along any row to constrain it; click it again to clear.",
+        "Then read the axes for what is forced, and the strip underneath for how much of the space is left. We have cleared the demo constraint — reopen this guide any time with ? in the top bar.",
+      ],
+      next: "Explore",
+      setup: "clear",
+    },
+  ]);
+
+  // Each step sets up the app for what it explains, keyed off an explicit `setup`
+  // tag. (Deriving it from the target selector or the title looks tidier but two
+  // steps share the flex panel, and matching on prose breaks the moment the text
+  // or an axis name changes.) Runs on entry, and re-runs when stepping back.
+  function applyTourStep(i: number) {
+    switch (tourSteps[i]?.setup) {
+      case "reset":
+        viewMode = "coupling";
+        couplingPair = null; couplingFull = false;
+        clearScenario();
+        break;
+      case "facet":
+        viewMode = "coupling";
+        if (demoAxis && demoAxis2) {
+          facetSel = { x: demoAxis, y: demoAxis2 };
+          couplingPair = { x: demoAxis, y: demoAxis2 };
+        }
+        break;
+      case "cap-demo":
+        couplingPair = null; couplingFull = false;
+        capLever(demoAxis);
+        break;
+      case "cap-contrast":
+        capLever(demoAxis2);
+        break;
+      case "clear":
+        couplingPair = null; couplingFull = false;
+        clearScenario();
+        break;
+    }
+  }
+
+  function startTour() {
+    tourStep = 0;
+    tourOpen = true;
+    applyTourStep(0);
+    try { localStorage.setItem(TOUR_SEEN, "1"); } catch { /* storage disabled */ }
+  }
+  function gotoTourStep(i: number) {
+    tourStep = i;
+    applyTourStep(i);
+  }
+  function endTour() {
+    tourOpen = false;
+    clearScenario();
+    couplingPair = null; couplingFull = false;
+  }
+  // First visit only: offer the walkthrough once the tool has real data in it.
+  // `autoOffered` is a plain let, not state: it must gate this effect without
+  // re-triggering it, and it is what stops the tour reopening on every close when
+  // localStorage is unavailable (there `seen` would stay empty forever).
+  let autoOffered = false;
+  $effect(() => {
+    if (!started || !meta || !flexBase.length || tourOpen || autoOffered) return;
+    let seen = "1";
+    try { seen = localStorage.getItem(TOUR_SEEN) ?? ""; } catch { /* storage disabled */ }
+    autoOffered = true;
+    if (!seen) startTour();
+  });
+
   // ---- settings ----
+  /** 20000 -> "20k". The chip is a glance, not a readout — the exact count is in
+   *  its tooltip and in Settings. */
+  const compactN = (n: number) =>
+    n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 || n >= 10000 ? 0 : 1)}k` : `${n}`;
+
+  // What the floating panels cover of the full-bleed map canvas. Mirrors the
+  // layout custom properties on `.stage` — keep the two in step, or the cloud
+  // will centre on the wrong window.
+  const RAIL_W = 348, EDGE = 16, BAR_H = 60;
+  const mapInset = { left: RAIL_W + EDGE * 2, top: BAR_H + EDGE, right: EDGE, bottom: EDGE };
+
   let showSettings = $state(false);
+
+  // ---- theme ----
+  // Dark default. The OS preference only supplies the initial value; once the
+  // user picks, that choice wins in both directions and persists. `data-theme` on
+  // <html> is what the token sheet and the canvas readers key off.
+  const THEME_KEY = "ee.theme";
+  let theme = $state<"dark" | "light">("dark");
+  // Canvas components take this as a prop purely as a redraw trigger (canvases
+  // hold baked pixels, so CSS cannot restyle them). It is DERIVED from the theme,
+  // not incremented: `themeTick++` inside the effect below read and wrote the same
+  // state, which is the self-referencing-effect infinite loop CLAUDE.md warns
+  // about — it froze the app, and neither `check` nor `build` can catch it.
+  const themeTick = $derived(theme === "light" ? 1 : 0);
+  onMount(() => {
+    let t: string | null = null;
+    try { t = localStorage.getItem(THEME_KEY); } catch { /* storage disabled */ }
+    if (t !== "light" && t !== "dark")
+      t = window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    theme = t as "dark" | "light";
+  });
+  $effect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    setColorTheme(theme);   // ramps + categorical palette follow the theme
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* storage disabled */ }
+  });
+  // Map overlay/projection popover. Mutually exclusive with Settings — both
+  // anchor to the same top-left corner now that the graph is full-width.
+  let showLayers = $state(false);
   // per-dimension on/off (keyed by axis name; missing/true = enabled). Disabled
-  // dimensions are hidden from the parallel coords, the Coupling matrix, the facet, and the color/slice
+  // dimensions are hidden from the parallel coords, the Coupling matrix, the facet, and the color
   // pickers. The Map (PCA) projection always uses all technologies.
   let dimEnabled = $state<Record<string, boolean>>({});
   let reduceMotion = $state(false);
@@ -618,11 +847,10 @@
   function setAllDims(on: boolean) {
     dimEnabled = Object.fromEntries((meta?.axes ?? []).map((a) => [a, on]));
   }
-  // If the color/slice axis gets disabled, fall back gracefully.
+  // If the colored axis gets disabled, fall back gracefully.
   // Converges in one step: each guard's condition is false once it has fired.
   $effect(() => {
     if (field && dimEnabled[field] === false) { field = ""; loadColor(); }
-    if (sliceAxis && dimEnabled[sliceAxis] === false) exitSlice();
     // The docked coupling facet must not outlive its axes: without this it keeps
     // captioning a dimension the user just switched off, and — since the split is
     // what hides the validation scatter — leaves it hidden with no cell selected.
@@ -697,57 +925,6 @@
     return v.length === subIndex.length ? v : subIndex.map((r) => v[r]);
   });
 
-  // ---- slice / sweep (cut one axis, watch the other levers' densities & ranges
-  // change) — the "slice the polytope" idea from the supervisor's whiteboard. ----
-  // sampled extent of an axis (where the sample cloud actually is)
-  function axisSpan(axis: string): { j: number; lo: number; hi: number } | null {
-    const j = dispFields.indexOf(axis);
-    if (j < 0 || !dispValues.length) return null;
-    let lo = Infinity, hi = -Infinity;
-    for (const row of dispValues) { const v = row[j]; if (v < lo) lo = v; if (v > hi) hi = v; }
-    return { j, lo, hi };
-  }
-  // exact feasible extent (LP flexibility) — the polytope reaches further than the
-  // samples do, so the slider spans this and marks the sampled sub-range on it.
-  function feasSpan(axis: string): { j: number; lo: number; hi: number } | null {
-    const j = dispFields.indexOf(axis);
-    if (j < 0) return null;
-    const rg = flexBase.find((r) => r.axis === axis);
-    const s = axisSpan(axis);
-    let lo = rg?.min ?? s?.lo ?? 0;
-    let hi = rg?.max ?? s?.hi ?? 1;
-    if (hi <= lo) hi = lo + 1;
-    if (Math.abs(lo) < 1e-6 * (hi - lo)) lo = 0; // snap LP dust (−1e−12) to a clean 0
-    return { j, lo, hi };
-  }
-  const sliceRange = $derived(sliceAxis ? feasSpan(sliceAxis) : null);      // slider bounds
-  const sliceSampled = $derived(sliceAxis ? axisSpan(sliceAxis) : null);    // shaded sub-range
-  function startSlice(axis: string | null) {
-    simPin = null;
-    if (!axis) { exitSlice(); selected = null; return; }
-    // start in the middle of the *sampled* region so the first slice isn't empty
-    const sp = axisSpan(axis) ?? feasSpan(axis);
-    sliceAxis = axis;
-    if (sp) sliceValue = (sp.lo + sp.hi) / 2;
-  }
-  const sliceBand = $derived.by(() => {
-    if (!sliceAxis || !sliceRange) return null;
-    const half = sliceWidth * (sliceRange.hi - sliceRange.lo);
-    return { axis: sliceAxis, lo: sliceValue - half, hi: sliceValue + half };
-  });
-  // Sweeping the slice drives the selection (→ conditional violins on the other
-  // axes) and a live constraint (→ exact flexibility / consequences of fixing it).
-  $effect(() => {
-    const band = sliceBand, r = sliceRange;
-    if (!band || !r) return;
-    const rows: number[] = [];
-    for (let i = 0; i < dispValues.length; i++) {
-      const v = dispValues[i][r.j];
-      if (v >= band.lo && v <= band.hi) rows.push(i);
-    }
-    selected = rows;
-    brushConstraints = [{ axis: band.axis, min: band.lo, max: band.hi }];
-  });
   const colorIdx = $derived(
     dispFields.indexOf(field === "chain" ? "net_present_cost" : field),
   );
@@ -823,16 +1000,19 @@
     if (pins.length >= 1 && pins.length < 2) return pins[0].values;
     return null;
   });
+  // null => ParallelCoords falls back to --tick, i.e. a mark that reads against
+  // the CURRENT surface. This used to be a literal "#ffffff", which made the
+  // A->B sweep line invisible on a light panel.
   const pcOverlayColor = $derived(
-    hoverPin !== null && pins[hoverPin] ? pins[hoverPin].color : "#ffffff",
+    hoverPin !== null && pins[hoverPin] ? pinColors[hoverPin] : null,
   );
   // The two interpolation endpoints, drawn statically in their pin colors on the
   // parallel coordinates while the white overlay sweeps between them.
   const pcStatic = $derived(
     pins.length >= 2
       ? [
-          { values: pins[0].values, color: pins[0].color },
-          { values: pins[1].values, color: pins[1].color },
+          { values: pins[0].values, color: pinColors[0] },
+          { values: pins[1].values, color: pinColors[1] },
         ]
       : [],
   );
@@ -844,6 +1024,9 @@
   // Order the parallel-coords axes so strongly-coupled ones (high distance
   // correlation) sit next to each other, making trade-offs read between neighbors.
   let couplingAxes = $state(true);
+  // optimum tick on each Profiles row. Distinct from `showOptimum`, which is the
+  // Map's ◯ overlay — the rows are in both views, so they need their own flag.
+  let showOptTicks = $state(false);
   // Same hierarchical clustering the Coupling matrix uses (see cluster.ts), so the
   // two views agree on what "next to each other" means.
   // Permutation of dispFields column indices; [] means canonical order.
@@ -870,6 +1053,36 @@
   const pcOverlayOrd = $derived(pcOverlay ? reorder(pcOverlay, pcCols) : pcOverlay);
   const pcStaticOrd = $derived(pcStatic.map((s) => ({ values: reorder(s.values, pcCols), color: s.color })));
   const pcDomainExtraOrd = $derived(pcDomainExtra.map((row) => reorder(row, pcCols)));
+  // Optimum keyed by axis NAME so it survives the pcCols permutation and the
+  // candidate-set field list — no reorder() needed, which is the point.
+  // physical unit per axis name, from the polytope file (see /api/meta)
+  const unitsByAxis = $derived(
+    Object.fromEntries((meta?.axes ?? []).map((a, i) => [a, meta?.units?.[i] ?? ""])));
+  // ---- facet shape taxonomy controls (Settings) ----
+  let showShapes = $state(true);
+  let gapEps = $state(GAP_EPS_DEFAULT);
+
+  // Shape verdict for the docked facet — the plain-language payoff for the
+  // outline you are looking at ("ccs_lump at scale requires biomass").
+  let pairGaps = $state<CornerGaps | null>(null);
+  let shapeSeq = 0;
+  $effect(() => {
+    const p = couplingPair;
+    const my = ++shapeSeq;
+    if (!p) { pairGaps = null; return; }
+    getShadow(p.x, p.y, []).then((s) => {
+      if (my === shapeSeq) pairGaps = s.corner_gaps ?? null;
+    }).catch(() => { if (my === shapeSeq) pairGaps = null; });
+  });
+  // classified here, with the same threshold the matrix uses
+  const pairShape = $derived(
+    couplingPair && pairGaps
+      ? classifyFacet(pairGaps, short(couplingPair.x), short(couplingPair.y), gapEps)
+      : null);
+
+
+  const optimumByAxis = $derived(
+    (meta?.axes ?? []).map((a, i) => ({ axis: a, value: meta!.optimum.u_star[i] })));
 
   // ---- hover tooltip ----
   // hoverIdx is the position within the rendered arrays; dispValues / dispPoints
@@ -917,21 +1130,86 @@
     return { infeasible: false, items: items.slice(0, 6) };
   });
 
-  // ---- volume retained: how much of the near-optimal space survives the current
-  // constraints. Cheap Monte-Carlo estimate = fraction of the uniform sample cloud
-  // that falls in the constrained box (uniform samples → fraction ≈ volume ratio).
-  // Wilson 95% interval for honesty; when 0 samples land the true volume is below
-  // the sampling resolution (1/N), so we report an upper bound instead of "0".
-  const volumeRetained = $derived.by(() => {
+  // ---- profile marginals measured in the SHOWN space (worldview B) ----
+  // Reading the full-space cloud along an axis weights every combination of the
+  // shown axes by how many ways the HIDDEN axes can realize it, so hiding an
+  // axis left every violin pixel-identical — the geometric no-op. Worldview B
+  // instead treats the shown axes as the design space: uniform over pi_S(P), the
+  // reachable combinations, each counted once. Under B, disabling an axis
+  // genuinely reshapes the remaining distributions.
+  //
+  // Only fetched for a STRICT subset: with everything shown pi_S(P) = P and the
+  // base cloud already is the answer (and is far larger than we could sample).
+  // In candidate mode the plot is showing designs generated inside the region,
+  // which is its own distribution and must not be overwritten.
+  // Debounced + sequence-guarded: axis toggles arrive in bursts and the sweep
+  // costs ~3.5 ms/sample, so out-of-order replies would clobber newer state.
+  const subsetActive = $derived(nActive > 0 && nActive < (meta?.axes.length ?? 0));
+  let marginals = $state<Marginals | null>(null);
+  let marginalBusy = $state(false);
+  // The violins fall back to the full-space cloud when this fetch fails. That is
+  // a DIFFERENT distribution, not a degraded one, so it has to be said out loud
+  // rather than silently drawn as if it were the projection.
+  let marginalFailed = $state(false);
+  let marginalSeq = 0;
+  let marginalTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const axes = activeAxes, sub = subsetActive, cand = inCandidates;
+    const my = ++marginalSeq;
+    if (!sub || cand || !axes.length) {
+      marginals = null; marginalBusy = false; marginalFailed = false;
+      return;
+    }
+    marginalBusy = true;
+    marginalTimer = setTimeout(async () => {
+      try {
+        const r = await getMarginals(axes);
+        if (my === marginalSeq) { marginals = r; marginalFailed = false; }
+      } catch {
+        if (my === marginalSeq) { marginals = null; marginalFailed = true; }
+      } finally { if (my === marginalSeq) marginalBusy = false; }
+    }, 350);
+    return () => { if (marginalTimer) clearTimeout(marginalTimer); };
+  });
+
+  // Permute the projected sample's columns onto `pcFields`. Keyed by axis NAME:
+  // pcFields carries the coupling seriation, so an index-keyed map would put a
+  // distribution on the wrong row.
+  const pcMarginals = $derived.by(() => {
+    const m = marginals;
+    if (!m || !m.values.length) return null;
+    const cols = pcFields.map((f) => m.axes.indexOf(f));
+    if (cols.some((c) => c < 0)) return null;   // stale reply for another axis set
+    return m.values.map((row) => cols.map((c) => row[c]));
+  });
+
+  // ---- how many sampled designs land inside the constraints ----
+  // This is a statement about the CLOUD, not about the space: it decides whether
+  // the sample is dense enough here to be worth drawing, and nothing else.
+  //
+  // A "% of the space left" headline used to live here — a Monte-Carlo volume
+  // ratio, plus a projected variant (worldview B) for when axes were hidden.
+  // Both were removed: the two disagreed in both directions, the projected one
+  // was not monotone under hiding an axis, and a single percentage implied a
+  // precision the estimate did not have. What the UI still says about a
+  // constraint is exact: the LP feasibility verdict and the per-axis ranges.
+  //
+  // ALWAYS counted against the uniform base cloud, never `dispValues`. In
+  // candidate mode dispValues IS the constrained region (hit-and-run run inside
+  // it), so every row satisfies the constraints and the count is meaningless.
+  const VOL_TRUST_K = 200; // below this many in-region samples, offer a resample
+  const inRegion = $derived.by(() => {
     const cons = allConstraints;
-    const n = dispValues.length;
+    const rows = samples?.values ?? [];
+    const flds = samples?.fields ?? [];
+    const n = rows.length;
     if (!cons.length || !n) return null;
     const cols = cons
-      .map((c) => ({ j: dispFields.indexOf(c.axis), min: c.min, max: c.max }))
+      .map((c) => ({ j: flds.indexOf(c.axis), min: c.min, max: c.max }))
       .filter((c) => c.j >= 0);
     if (!cols.length) return null;
     let k = 0;
-    for (const row of dispValues) {
+    for (const row of rows) {
       let ok = true;
       for (const c of cols) {
         const v = row[c.j];
@@ -940,78 +1218,64 @@
       }
       if (ok) k++;
     }
-    const p = k / n;
-    const z = 1.96, z2 = z * z; // Wilson score interval (well-behaved near 0)
-    const denom = 1 + z2 / n;
-    const center = (p + z2 / (2 * n)) / denom;
-    const half = (z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)) / denom;
-    return {
-      k, n,
-      pct: p * 100,
-      lo: Math.max(0, center - half) * 100,
-      hi: Math.min(1, center + half) * 100,
-      resPct: (1 / n) * 100, // sampling resolution: nothing below this is countable
-    };
+    return { k, n };
   });
 
-  // When the sample count gets too low to trust (deep in the tail), ask the backend
-  // for a subset-simulation estimate — accurate where the raw fraction reads ~0.
-  // Debounced + sequence-guarded like the flexibility fetch.
-  let volEstimate = $state<VolumeEstimate | null>(null);
-  let volBusy = $state(false);
-  let volSeq = 0;
-  let volTimer: ReturnType<typeof setTimeout> | undefined;
-  const VOL_TRUST_K = 200; // ≥ this many samples in-region → the raw fraction is fine
-  $effect(() => {
-    const cons = allConstraints;
-    const vr = volumeRetained;
-    const my = ++volSeq;
-    if (!cons.length || !vr || vr.k >= VOL_TRUST_K) {
-      volEstimate = null; volBusy = false;
-      return;
-    }
-    volBusy = true;
-    volTimer = setTimeout(async () => {
-      try {
-        const r = await getVolume(cons);
-        if (my === volSeq) volEstimate = r;
-      } catch { if (my === volSeq) volEstimate = null; }
-      finally { if (my === volSeq) volBusy = false; }
-    }, 400);
-    return () => { if (volTimer) clearTimeout(volTimer); };
-  });
 </script>
 
 {#if restoring}
   <div class="restoring">restoring your dataset…</div>
 {:else if !started}
-  <Landing onready={onLandingReady} />
+  <Landing onready={onLandingReady}
+           oncancel={resumeMeta ? resumeSession : null}
+           currentName={resumeMeta?.dataset.name ?? null} />
 {:else}
 <div class="stage" role="presentation" onmousemove={onMove}>
   <!-- top bar -->
   <header class="hud panel topbar">
+    <!-- Left = who you are and what is loaded. This used to be the wordmark plus
+         THREE identically-styled word pills, which gave the rarest and most
+         disruptive action (rebuilding the session on a new dataset) the most
+         prominent slot and left the loaded dataset's name visible only inside
+         Settings. Now the name IS the control. -->
     <div class="brand">
-      <h1>Energy Explorer <small>near-optimal energy-system designs</small></h1>
-      <button class="change-ds" title="pick or upload another dataset" onclick={changeDataset}>⟳ change dataset</button>
-      <button class="change-ds" class:on={showSettings} title="settings"
-              aria-label="settings" onclick={() => (showSettings = !showSettings)}>⚙ settings</button>
+      <h1>Energy Explorer</h1>
+      <button class="ds-chip" onclick={changeDataset}
+              title="{meta?.dataset.name ?? 'dataset'} · {meta?.n_samples.toLocaleString() ?? '—'} designs · {meta?.axes.length ?? '—'} technologies — click to pick or upload another">
+        <span class="ds-name">{meta?.dataset.name ?? "—"}</span>
+        {#if meta}<span class="ds-n">{compactN(meta.n_samples)}</span>{/if}
+      </button>
     </div>
-    <div class="seg view-seg">
+    <div class="seg view-seg" data-tour="views">
       <button class:active={viewMode === "coupling"} onclick={() => (viewMode = "coupling")}>Coupling</button>
       <button class:active={viewMode === "map"} onclick={() => (viewMode = "map")}>Map</button>
     </div>
-    {#if proj && viewMode === "map"}
-      <span class="topbar-hint">
-        {mode === "select" ? "drag to lasso-select" : "scroll to zoom · drag to pan · click a point to pin"}
-        {#if isStar} · drag ◯ / pins to rotate the projection{/if}
-        {#if !isMetric} · {method.toUpperCase()} axes are non-metric{/if}
-      </span>
-    {:else if viewMode === "coupling"}
-      <span class="topbar-hint">nonlinear dependence between axes (distance correlation / mutual information) · click a cell → its exact facet · brush below to constrain</span>
-    {/if}
+    <!-- Right = the view's own context, then the two global actions. The Map's
+         gestures are invisible affordances on a WebGL canvas, so a short reminder
+         earns its place; the Coupling sentence was deleted — the matrix already
+         carries its own title, metric toggle, colour legend and per-pair caption,
+         so it was a paragraph restating the panel below it. -->
+    <div class="bar-right">
+      {#if proj && viewMode === "map"}
+        <span class="topbar-hint">
+          {mode === "select" ? "drag to lasso-select" : "scroll zoom · drag pan · click to pin"}{#if isStar} · drag ◯ to rotate{/if}{#if !isMetric} · {method.toUpperCase()} is non-metric{/if}
+        </span>
+      {/if}
+      <button class="icon-btn" class:on={showSettings} title="settings"
+              aria-label="settings"
+              onclick={() => { showSettings = !showSettings; if (showSettings) showLayers = false; }}>⚙</button>
+      <button class="icon-btn" class:on={tourOpen} title="guided walkthrough"
+              aria-label="guided walkthrough" onclick={startTour}>?</button>
+    </div>
   </header>
 
   {#if showSettings}
+    <!-- Ordered by how often it is touched, and SCOPED to the current view: the
+         facet threshold means nothing on the Map and the cluster count means
+         nothing in Coupling, so showing both everywhere made a six-section wall
+         of which two sections were always inert. Appearance absorbed the orphan
+         "Reduce motion" checkbox, which used to sit at the bottom under no
+         heading at all. -->
     <div class="settings-pop hud panel">
       <div class="settings-head">
         <span>Settings</span>
@@ -1019,10 +1283,19 @@
       </div>
 
       <div class="set-sect">
+        <div class="set-label"><span>Color by</span></div>
+        <select bind:value={field} onchange={loadColor}>
+          <option value="">— none —</option>
+          {#each activeAxes as a}<option value={a}>{short(a)}</option>{/each}
+        </select>
+        <span class="muted small">encodes one technology as colour across every view.</span>
+      </div>
+
+      <div class="set-sect">
         <div class="set-label">
-          <span>Dimensions</span>
+          <span>Visible axes</span>
           <span class="set-actions">
-            <button class="link" onclick={() => setAllDims(true)} disabled={nActive === (meta?.axes.length ?? 0)}>all on</button>
+            <button class="link" onclick={() => setAllDims(true)} disabled={nActive === (meta?.axes.length ?? 0)}>show all</button>
           </span>
         </div>
         {#each meta?.axes ?? [] as a}
@@ -1033,21 +1306,69 @@
             {short(a)}
           </label>
         {/each}
-        <span class="muted small">{nActive} of {meta?.axes.length ?? 0} on · shown in the parallel coords and the Coupling matrix (and the facet it opens). The Map (PCA) always uses all technologies.</span>
+        <!-- This paragraph used to say hiding was "display only" and that the
+             violins were "already marginals over the full space". Both stopped
+             being true when the violins moved into the projection — see
+             PROCESSES.md §4b. Getting this wrong is exactly the hide-vs-constrain
+             confusion the docs warn about, so it is worth the words. -->
+        <span class="muted small">
+          {nActive} of {meta?.axes.length ?? 0} shown. Hiding an axis does
+          <strong>not</strong> narrow the space — it still constrains every other one, and
+          nothing here can make an infeasible set feasible. What it does change is the
+          question the <strong>Profiles</strong> distributions answer: they are re-measured
+          over the combinations of the axes you kept, so the violins reshape.
+          Coupling values, facets and the Map are unaffected. To actually narrow the
+          space, drag along a row.
+        </span>
       </div>
 
-      <div class="set-sect">
-        <div class="set-label"><span>Map clusters</span></div>
-        <label class="range-row">
-          <input type="range" min="2" max="12" step="1" bind:value={clusterK} onchange={loadClusters} />
-          <span class="range-val">{clusterK}</span>
-        </label>
-        <span class="muted small">number of k-means groups labelled on the Map.</span>
-      </div>
+      {#if viewMode === "coupling"}
+        <div class="set-sect">
+          <div class="set-label"><span>Facet shapes</span></div>
+          <label class="check"><input type="checkbox" bind:checked={showShapes} /> colour the matrix by category</label>
+          {#if showShapes}
+            <label class="range-row" title="how much of a corner must be cut before it is reported — a materiality choice, not a measurement limit">
+              <input type="range" min="0.05" max="0.35" step="0.01" bind:value={gapEps} />
+              <span class="range-val">{gapEps.toFixed(2)}</span>
+            </label>
+            <span class="muted small">
+              threshold on the corner gap. The gaps are exact to ~1e-3, so this only sets
+              what counts as worth reporting — slide it to see which calls are borderline.
+            </span>
+          {/if}
+        </div>
+      {:else}
+        <div class="set-sect">
+          <div class="set-label"><span>Map clusters</span></div>
+          <label class="range-row">
+            <input type="range" min="2" max="12" step="1" bind:value={clusterK} onchange={loadClusters} />
+            <span class="range-val">{clusterK}</span>
+          </label>
+          <span class="muted small">number of k-means groups labelled on the Map.</span>
+        </div>
+      {/if}
 
       <div class="set-sect">
+        <div class="set-label"><span>Appearance</span></div>
+        <div class="seg">
+          <button class:active={theme === "dark"} onclick={() => (theme = "dark")}>Dark</button>
+          <button class:active={theme === "light"} onclick={() => (theme = "light")}>Light</button>
+        </div>
         <label class="check"><input type="checkbox" bind:checked={reduceMotion} /> Reduce motion</label>
         <span class="muted small">disable the facet slide-in and other animations.</span>
+      </div>
+
+      <div class="set-sect">
+        <div class="set-label"><span>Dataset</span></div>
+        <div class="data-name" title={meta?.dataset.name}>{meta?.dataset.name ?? "—"}</div>
+        {#if meta}
+          <span class="muted small">
+            <strong>{Math.min(DISPLAY_N, meta.n_samples).toLocaleString()}</strong> of
+            {meta.n_samples.toLocaleString()} designs shown · {meta.axes.length} technologies{#if proj} ·
+            {proj.method.toUpperCase()}{/if}
+          </span>
+        {/if}
+        <span class="muted small">click the dataset name in the top bar to pick or upload another polytope.</span>
       </div>
     </div>
   {/if}
@@ -1055,10 +1376,13 @@
   <!-- borderless graph between the panels -->
   {#if viewMode === "coupling"}
     <div class="graph-region coupling-split" class:split={couplingPair} class:facet-full={couplingPair && couplingFull}>
-      <div class="cpl-matrix">
+      <div class="cpl-matrix" data-tour="matrix">
         <DependenceMatrix
           dep={depView}
+          pairs={shadowPairs}
           metric={depMetric}
+          {showShapes}
+          {gapEps}
           onmetric={(m) => (depMetric = m)}
           onpair={(x, y) => { facetSel = { x, y }; couplingPair = { x, y }; }}
         />
@@ -1066,14 +1390,26 @@
       {#if couplingPair}
         <div class="cpl-facet" transition:fly={{ x: 60, duration: reduceMotion ? 0 : 280, easing: cubicOut }}>
           <div class="cpl-facet-head">
-            <span class="cpl-facet-title">exact facet · {short(couplingPair.x)} × {short(couplingPair.y)}</span>
-            <button class="cpl-full" title={couplingFull ? "back to the matrix" : "expand the facet over the matrix"}
+            <span class="cpl-facet-title">
+              exact facet · {short(couplingPair.x)} × {short(couplingPair.y)}
+              {#if pairShape}
+                <span class="shape-tag" style="--c:{CAT[pairShape.category].color}">
+                  {CAT[pairShape.category].label}{#if pairShape.borderline} ?{/if}
+                </span>
+              {/if}
+            </span>
+            <button class="cpl-full" data-tour="full-view" title={couplingFull ? "back to the matrix" : "expand the facet over the matrix"}
                     onclick={() => (couplingFull = !couplingFull)}>
               {couplingFull ? "⛶ exit full view" : "⛶ full view"}
             </button>
             <button class="cpl-close" title="close facet panel" aria-label="close facet panel"
                     onclick={() => { couplingPair = null; couplingFull = false; }}>✕</button>
           </div>
+          {#if pairShape?.detail}
+            <p class="shape-detail">
+              {pairShape.detail}{#if pairShape.category !== "independent"} · {(pairShape.strength * 100).toFixed(0)}% of the corner is ruled out{/if}
+            </p>
+          {/if}
           {#if dispFields.length}
             <div class="cpl-facet-body">
               <FacetView
@@ -1082,6 +1418,7 @@
                 activeFields={activeAxes}
                 colorValues={dispColorValues}
                 colorCategorical={dispCategorical}
+                theme={theme}
                 colorMin={dispColorMin}
                 colorMax={dispColorMax}
                 constraints={allConstraints}
@@ -1096,9 +1433,15 @@
       {/if}
     </div>
   {:else if viewMode === "map" && proj}
-    <div class="graph-region">
+    <!-- Full-bleed: the canvas runs under the top bar and the Profiles rail so
+         there is no strip of page showing between them. `inset` keeps the DATA
+         inside the visible window — without it the cloud centres on the whole
+         canvas and a fifth of it hides behind the rail. -->
+    <div class="graph-region bleed">
       <ScatterGL
+        inset={mapInset}
         bind:this={scatter}
+        {themeTick}
         points={dispPoints}
         color={dispColorValues}
         categorical={dispCategorical}
@@ -1111,19 +1454,22 @@
         {showDensity}
         spokes={spokeMarkers}
         {showSpokes}
-        pins={pins.map((p, i) => ({ id: p.id, letter: String.fromCharCode(65 + i), point: pinPoints[i], color: p.color }))}
+        pins={pins.map((p, i) => ({ id: p.id, letter: String.fromCharCode(65 + i), point: pinPoints[i], color: pinColors[i] }))}
         path={morphPath}
         walkChains={inCandidates ? 0 : 4}
         walkActive={walkOn && !inCandidates}
         {selected}
         {mode}
         onhover={(i) => (hoverIdx = i)}
-        onselect={(idx) => { exitSlice(); selected = idx.length ? idx : null; simPin = null; }}
+        onselect={(idx) => { clearBrushConstraints(); selected = idx.length ? idx : null; simPin = null; }}
         onpin={pinRow}
         onspoke={pinExtreme}
         draggableMarkers={isStar && !inCandidates}
         onmarkerdrag={onMarkerDrag}
       />
+    </div>
+    <!-- outside the bleeding region, so the axis names stay clear of the panels -->
+    <div class="map-labels">
       <div class="ylabel">{axisLabel(1)}</div>
       <div class="xlabel">{axisLabel(0)}</div>
     </div>
@@ -1148,236 +1494,84 @@
     <div class="tooltip" style="left:{mouse[0] + 14}px; top:{mouse[1] + 14}px">
       <div class="tt-title">{inCandidates ? "candidate" : "design"} #{!inCandidates && subIndex ? subIndex[hoverRow] : hoverRow}</div>
       {#each dispFields as f, j}
-        <div class="tt-row" class:cost={f === "net_present_cost"}>
-          <span>{short(f)}</span><span>{fmt(dispValues[hoverRow][j])}</span>
+        <div class="tt-row">
+          <span>{short(f)}</span>
+          <span>{fmt(dispValues[hoverRow][j])} <em>{shortUnit(unitsByAxis[f])}</em></span>
         </div>
       {/each}
     </div>
   {/if}
 
-  <!-- floating control panel (left) -->
-  <aside class="hud panel">
-    {#if viewMode === "map"}
-      <label>Method
-        <select bind:value={method} onchange={onMethodChange}>
-          {#each meta?.methods ?? ["pca"] as m}<option value={m}>{m.toUpperCase()}</option>{/each}
-          <option value="star">STAR ✦ (drag anchors)</option>
-        </select>
-      </label>
-    {/if}
-
-    {#if isStar && viewMode === "map"}
-      <div class="star-box">
-        {#if normTech && starAnchors.length}
-          <StarWheel
-            anchors={starAnchors}
-            labels={techLabels}
-            {touring}
-            onchange={(a) => (starAnchors = a)}
-            ontour={toggleTour}
-            onresetPca={() => (starAnchors = pcaAnchors())}
-            onresetCircle={() => (starAnchors = circleAnchors())}
-          />
-        {:else}
-          <span class="muted small">loading normalized samples…</span>
-        {/if}
-      </div>
-    {/if}
-    <label>Color by
-      <select bind:value={field} onchange={loadColor}>
-        <option value="">— none —</option>
-        {#each activeAxes as a}<option value={a}>{a}</option>{/each}
-      </select>
-    </label>
-
-    <div class="sect">Slice</div>
-    <label>Slice axis
-      <select value={sliceAxis ?? ""} onchange={(e) => startSlice(e.currentTarget.value || null)}>
-        <option value="">— off —</option>
-        {#each activeAxes as a}<option value={a}>{short(a)}</option>{/each}
-      </select>
-    </label>
-    {#if sliceAxis && sliceRange}
-      {@const span = sliceRange.hi - sliceRange.lo}
-      {@const sLo = sliceSampled ? Math.max(0, Math.min(100, ((sliceSampled.lo - sliceRange.lo) / span) * 100)) : 0}
-      {@const sHi = sliceSampled ? Math.max(0, Math.min(100, ((sliceSampled.hi - sliceRange.lo) / span) * 100)) : 100}
-      {@const inTail = !!sliceSampled && (sliceValue < sliceSampled.lo || sliceValue > sliceSampled.hi)}
-      <div class="slice-track">
-        <div class="slice-base"></div>
-        <div class="slice-sampled" style="left:{sLo}%; right:{100 - sHi}%"></div>
-        <input class="slice-slider" type="range"
-          min={sliceRange.lo} max={sliceRange.hi} step={span / 200}
-          bind:value={sliceValue} />
-      </div>
-      <div class="slice-info">
-        {short(sliceAxis)} ≈ <strong>{fmt(sliceValue)}</strong>
-        {#if inTail}<span class="slice-tail">· thin tail (no samples)</span>{/if}
-      </div>
-      <label class="slice-w">band ±{(sliceWidth * 100).toFixed(0)}%
-        <input type="range" min="0.01" max="0.15" step="0.01" bind:value={sliceWidth} />
-      </label>
-      <span class="muted small">slider spans the full feasible range; the <span class="slice-legend">magenta</span> stretch is where designs are actually sampled · volume retained is under Consequences</span>
-    {/if}
-
-    {#if viewMode === "map"}
-      <label class="check">
-        <input type="checkbox" bind:checked={showOptimum} /> cost optimum ◯
-      </label>
-      <label class="check">
-        <input type="checkbox" bind:checked={showClusters} /> region labels
-      </label>
-
-      <div class="sect">Overlays</div>
-      <label class="check">
-        <input type="checkbox" bind:checked={showDensity} /> option topography
-      </label>
-      <label class="check" class:dis={method !== "pca"}>
-        <input type="checkbox" bind:checked={showCompass} disabled={method !== "pca"} /> tech compass
-      </label>
-      <label class="check" class:dis={method !== "pca" || inCandidates}>
-        <input type="checkbox" bind:checked={showSpokes} disabled={method !== "pca" || inCandidates} /> extreme designs
-      </label>
-      <label class="check" class:dis={inCandidates}>
-        <input type="checkbox" bind:checked={walkOn} disabled={inCandidates} /> sampler walk
-      </label>
-
-      <div class="mode">
-        <span class="mode-label">Drag mode</span>
-        <div class="seg">
-          <button class:active={mode === "pan"} onclick={() => (mode = "pan")}>Pan</button>
-          <button class:active={mode === "select"} onclick={() => (mode = "select")}>Select</button>
+  <!-- Map-only controls. These used to be the bulk of the left rail; they only
+       ever apply to the scatter, so they live on it now. -->
+  {#if viewMode === "map"}
+    <button class="map-tool" class:on={showLayers} title="projection & overlays"
+            onclick={() => { showLayers = !showLayers; if (showLayers) showSettings = false; }}>
+      ▤ layers
+    </button>
+    {#if showLayers}
+      <div class="layers-pop hud panel">
+        <div class="settings-head">
+          <span>Layers</span>
+          <button class="cpl-close" aria-label="close layers" onclick={() => (showLayers = false)}>✕</button>
         </div>
-      </div>
-    {/if}
 
-    <div class="sel-info">
-      {#if selected}
-        <span><strong>{selected.length.toLocaleString()}</strong> selected</span>
-        <button class="link" onclick={clearSelection}>clear</button>
-      {:else}
-        <span class="muted">no selection</span>
-      {/if}
-    </div>
+        <div class="set-sect">
+          <label class="row-label">Projection
+            <select bind:value={method} onchange={onMethodChange}>
+              {#each meta?.methods ?? ["pca"] as m}<option value={m}>{m.toUpperCase()}</option>{/each}
+              <option value="star">STAR ✦ (drag anchors)</option>
+            </select>
+          </label>
+          {#if isStar}
+            <div class="star-box">
+              {#if normTech && starAnchors.length}
+                <StarWheel
+                  anchors={starAnchors}
+                  labels={techLabels}
+                  {touring}
+                  onchange={(a) => (starAnchors = a)}
+                  ontour={toggleTour}
+                  onresetPca={() => (starAnchors = pcaAnchors())}
+                  onresetCircle={() => (starAnchors = circleAnchors())}
+                />
+              {:else}
+                <span class="muted small">loading normalized samples…</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
 
-    {#if viewMode === "map"}
-      <button onclick={() => scatter?.reset()}>Reset view</button>
-    {/if}
+        <div class="set-sect">
+          <div class="set-label"><span>Overlays</span></div>
+          <label class="check"><input type="checkbox" bind:checked={showOptimum} /> cost optimum ◯</label>
+          <label class="check"><input type="checkbox" bind:checked={showClusters} /> region labels</label>
+          <label class="check"><input type="checkbox" bind:checked={showDensity} /> option topography</label>
+          <label class="check" class:dis={method !== "pca"}>
+            <input type="checkbox" bind:checked={showCompass} disabled={method !== "pca"} /> tech compass
+          </label>
+          <label class="check" class:dis={method !== "pca" || inCandidates}>
+            <input type="checkbox" bind:checked={showSpokes} disabled={method !== "pca" || inCandidates} /> extreme designs
+          </label>
+          <label class="check" class:dis={inCandidates}>
+            <input type="checkbox" bind:checked={walkOn} disabled={inCandidates} /> sampler walk
+          </label>
+        </div>
 
-    {#if consequences}
-      <div class="sect">Consequences</div>
-      {#if consequences.infeasible}
-        <span class="cons-bad">✕ no feasible design under these constraints</span>
-      {:else}
-        {#if flexBusy}<span class="muted small">updating…</span>{/if}
-        {#if volumeRetained}
-          <div class="cons-vol">
-            {#if volumeRetained.k >= 200}
-              <!-- plenty of samples in-region: the raw fraction is reliable -->
-              <span class="vol-num">volume retained ≈ {pct(volumeRetained.pct)}%</span>
-              <span class="vol-ci">95% CI [{pct(volumeRetained.lo)}–{pct(volumeRetained.hi)}%] · {volumeRetained.k.toLocaleString()}/{volumeRetained.n.toLocaleString()} designs</span>
-            {:else if volBusy && !volEstimate}
-              <span class="vol-num">volume retained ≈ estimating…</span>
-              <span class="vol-ci">too few samples land here — running subset simulation</span>
-            {:else if volEstimate && volEstimate.feasible && volEstimate.ratio > 0}
-              <span class="vol-num">volume retained ≈ {pct(volEstimate.ratio * 100)}%</span>
-              <span class="vol-ci">
-                ±{Math.round(volEstimate.cv * 100)}% ({volEstimate.method === "subset_simulation" ? `subset sim, ${volEstimate.levels} levels` : "sample estimate"}) ·
-                {volumeRetained.k.toLocaleString()}/{volumeRetained.n.toLocaleString()} sampled here
-              </span>
-            {:else if volEstimate && !volEstimate.feasible}
-              <span class="vol-num">volume retained ≈ 0%</span>
-              <span class="vol-ci">region is empty (or lower-dimensional)</span>
-            {:else}
-              <span class="vol-num">volume retained &lt; {pct(volumeRetained.resPct)}%</span>
-              <span class="vol-ci">below sampling resolution ({volumeRetained.n.toLocaleString()} samples)</span>
-            {/if}
+        <div class="set-sect">
+          <div class="set-label"><span>Drag mode</span></div>
+          <div class="seg">
+            <button class:active={mode === "pan"} onclick={() => (mode = "pan")}>Pan</button>
+            <button class:active={mode === "select"} onclick={() => (mode = "select")}>Select</button>
           </div>
-        {/if}
-        {#each consequences.items as it}
-          <div class="cons-item {it.kind}">{it.text}</div>
-        {/each}
-        {#if !consequences.items.length}
-          <span class="muted small">no lever forced or capped yet</span>
-        {/if}
-        {#if volumeRetained && volumeRetained.k < 200}
-          <span class="cons-note">the region stays feasible — the flexibility figures below are exact (LP on the polytope), independent of how many samples land here.</span>
-        {/if}
-      {/if}
-    {/if}
-
-    <div class="sect">Remaining flexibility</div>
-    {#if flexBase.length && meta}
-      <FlexBars
-        base={flexBase}
-        current={flexCur.length ? flexCur : flexBase}
-        optimum={meta.optimum.u_star}
-        feasible={flexFeasible}
-        busy={flexBusy}
-      />
-      <span class="muted small">exact feasible range per lever under your constraints (LP, not sample filtering)</span>
-    {:else}
-      <span class="muted small">computing ranges…</span>
-    {/if}
-
-    <div class="sect">Generate designs</div>
-    <div class="gen">
-      <div class="cons-add">
-        <select bind:value={newAxis}>
-          {#each meta?.axes ?? [] as a}<option value={a}>{short(a)}</option>{/each}
-        </select>
-        <div class="cons-row">
-          <input type="number" placeholder="min" bind:value={newMin} />
-          <input type="number" placeholder="max" bind:value={newMax} />
-          <button class="add" onclick={addConstraint} title="add constraint">+</button>
+          <button class="wide" onclick={() => scatter?.reset()}>Reset view</button>
         </div>
       </div>
-
-      {#if manualConstraints.length || brushConstraints.length}
-        <div class="chips">
-          {#each manualConstraints as c, i}
-            <span class="chip">
-              {short(c.axis)}{c.min != null ? " ≥ " + fmt(c.min) : ""}{c.max != null ? " ≤ " + fmt(c.max) : ""}
-              <button onclick={() => removeConstraint(i)}>×</button>
-            </span>
-          {/each}
-          {#each brushConstraints as c}
-            <span class="chip brush">{short(c.axis)} ∈ [{fmt(c.min)}, {fmt(c.max)}]</span>
-          {/each}
-        </div>
-      {:else}
-        <span class="muted small">no constraints · brush an axis or add one above</span>
-      {/if}
-
-      <label class="n-row">designs
-        <input type="number" min="200" max="5000" step="100" bind:value={genN} />
-      </label>
-      <button class="primary" onclick={generateNow} disabled={generating}>
-        {generating ? "Generating…" : "Generate"}
-      </button>
-      {#if genMsg}<span class="err-msg">{genMsg}</span>{/if}
-    </div>
-
-    <div class="info">
-      {#if meta}<p><strong>{Math.min(DISPLAY_N, meta.n_samples).toLocaleString()}</strong> of {meta.n_samples.toLocaleString()} samples shown · {meta.axes.length} dims</p>{/if}
-      {#if proj}<p class="muted">{proj.cached ? "cached" : "live"} {proj.method.toUpperCase()} · optimum {proj.optimum ? "shown" : "n/a"}</p>{/if}
-    </div>
-
-    {#if colorData}
-      <div class="legend">
-        <span class="legend-title">{colorData.field}</span>
-        <div class="ramp"></div>
-        <div class="ramp-labels"><span>{fmt(colorData.min)}</span><span>{fmt(colorData.max)}</span></div>
-      </div>
     {/if}
+  {/if}
 
-    <div class="sect">Dataset</div>
-    <div class="data-box">
-      <div class="data-name" title={meta?.dataset.name}>{meta?.dataset.name ?? "—"}</div>
-      <span class="muted small">use “⟳ change dataset” (top bar) to pick or upload another polytope</span>
-    </div>
-  </aside>
 
-  <!-- compare tray (right): pinned designs, radar glyphs, A→B morph -->
+  <!-- pinned designs (graph top-right, under the ▤ layers button): radar glyphs, A→B morph -->
   {#if viewMode === "map" && (pins.length || proj?.optimum)}
     <section class="hud panel tray">
       <div class="tray-head">
@@ -1393,7 +1587,7 @@
         <div
           class="card"
           role="group"
-          style="--pc:{p.color}"
+          style="--pc:{pinColors[i]}"
           onmouseenter={() => (hoverPin = i)}
           onmouseleave={() => (hoverPin = null)}
         >
@@ -1407,7 +1601,7 @@
               values={techValues(p)}
               ranges={techRanges}
               labels={techLabels}
-              color={p.color}
+              color={pinColors[i]}
               size={92}
             />
             <div class="card-actions">
@@ -1432,7 +1626,7 @@
                 values={morphTechValues}
                 ranges={techRanges}
                 labels={techLabels}
-                color="#ffffff"
+                color="var(--tick)"
                 size={108}
               />
               <span class="morph-cap muted small">
@@ -1446,20 +1640,55 @@
     </section>
   {/if}
 
-  <!-- parallel-coordinates panel: the bottom strip of every view -->
+  <!-- Profiles: one horizontal row per technology (the rail of every view) -->
   {#if dispValues.length}
-    <section class="hud panel pc-panel">
+    <section class="hud panel pc-panel" data-tour="pcoords">
       <div class="pc-head">
-        <span>
-          Parallel coordinates · {dispFields.length} axes · colored by {short(field)}
-          {#if inCandidates}<span class="muted">· generated candidates</span>{/if}
+        <span class="pc-title" title="drag along a row to filter · click it again to clear · hover for its exact range">
+          Profiles · {pcFields.length} axes
+          {#if inCandidates}<span class="muted">· generated</span>
+          {:else if subsetActive && marginalBusy}<span class="muted">· remeasuring</span>
+          {:else if subsetActive && marginalFailed}<span class="muted"
+            title="the distribution over the {nActive} shown axes could not be measured, so these are the full-space marginals — the same shape you would see with every axis on">· full-space marginals</span>
+          {/if}
         </span>
-        <label class="check small" title="order axes so strongly-coupled ones (distance correlation) are adjacent">
-          <input type="checkbox" bind:checked={couplingAxes} /> order by coupling
-        </label>
-        <span class="muted">drag along an axis to filter · click an axis to clear it</span>
+        {#if colorData}
+          <!-- inline, not a floating chip: in the Coupling view a chip over the
+               graph lands on the dependence matrix's own legend -->
+          <span class="pc-legend" title="colored by {short(colorData.field)}">
+            <span class="ramp" style="background:{markGradient(theme)}"></span>
+            <span class="ramp-ends">{fmt(colorData.min)}–{fmt(colorData.max)}</span>
+          </span>
+        {/if}
+        <span class="head-opts">
+          <label class="check small" title="order rows so strongly-coupled ones (distance correlation) are adjacent">
+            <input type="checkbox" bind:checked={couplingAxes} /> coupled order
+          </label>
+          <label class="check small" title="mark the cost-optimal value on each row (white tick)">
+            <input type="checkbox" bind:checked={showOptTicks} /> optimum
+          </label>
+        </span>
       </div>
-      <div class="pc-body">
+
+      <!-- #2: the headline sits above the rows it describes, not buried below -->
+      <div class="vol-slot" data-tour="consequences">
+        <ConsequenceStrip
+          variant="headline"
+          {consequences}
+          {inRegion}
+          {flexBusy}
+          resampling={generating}
+          error={genMsg}
+          {inCandidates}
+          trustK={VOL_TRUST_K}
+          onresample={generateNow}
+          selectedCount={selected?.length ?? null}
+          onclearselection={clearSelection}
+        />
+      </div>
+
+
+      <div class="pc-body" data-tour="flex">
         <ParallelCoords
           bind:this={pcoords}
           fields={pcFields}
@@ -1474,76 +1703,188 @@
           domainExtra={pcDomainExtraOrd}
           showViolins={true}
           flexRanges={flexCur.length ? flexCur : flexBase}
-          slice={sliceBand}
+          {flexBase}
+          optimum={optimumByAxis}
+          units={unitsByAxis}
+          showOptimum={showOptTicks}
+          {flexFeasible}
+          {flexBusy}
+          marginalValues={pcMarginals}
+          {marginalBusy}
+          {theme}
           {selected}
-          onbrush={(rows, cons) => { exitSlice(); selected = rows; brushConstraints = cons; simPin = null; }}
+          onbrush={(rows, cons) => { selected = rows; brushConstraints = cons; simPin = null; }}
         />
       </div>
+
+      <!-- Directly under the rows it annotates, ABOVE the key. It used to sit at
+           the very bottom, below a static legend — which buried the one block
+           here that responds to what you just did. -->
+      <div class="lim-slot">
+        <ConsequenceStrip variant="limits" {consequences} {flexBusy} />
+      </div>
+
+      <!-- Key for the marks drawn on each row. Swatches are mini-SVGs of the real
+           marks, not colour chips, because the marks differ in shape as well as
+           hue (a band, a tick and a density blob read differently).
+           ONE LINE, always — including with the optimum tick on, which is the
+           widest case. It is `nowrap`, and the swatch/gap sizes below are set so
+           all four entries fit the fixed 348 px rail; adding a fifth, or a longer
+           label, will silently clip rather than wrap. The violin had a "designs"
+           entry here and it was removed: it is the row's primary mark and needs no
+           legend, and dropping it is what buys the optimum entry its space. -->
+      <div class="pc-key">
+        <span class="k" title="exact feasible range under your constraints (LP on the polytope)">
+          <svg viewBox="0 0 22 10" aria-hidden="true">
+            <rect x="3" y="2" width="16" height="6" fill="var(--amber-soft)" />
+            <line x1="3" y1="1.5" x2="3" y2="8.5" stroke="var(--amber-line)" stroke-width="1.2" />
+            <line x1="19" y1="1.5" x2="19" y2="8.5" stroke="var(--amber-line)" stroke-width="1.2" />
+          </svg>feasible
+        </span>
+        <span class="k" title="the full near-optimal range before your constraints — only drawn once they differ">
+          <svg viewBox="0 0 22 10" aria-hidden="true">
+            <rect x="1" y="2" width="20" height="6" fill="var(--neutral-fill)" />
+            <line x1="1" y1="1.5" x2="1" y2="8.5" stroke="var(--neutral-line)" />
+            <line x1="21" y1="1.5" x2="21" y2="8.5" stroke="var(--neutral-line)" />
+          </svg>full range
+        </span>
+        <span class="k" title="the band you dragged, and the resulting subset's distribution">
+          <svg viewBox="0 0 22 10" aria-hidden="true">
+            <rect x="6" y="1" width="10" height="8" rx="1"
+                  fill="color-mix(in srgb, var(--accent) 18%, transparent)" stroke="var(--accent)" />
+          </svg>your cut
+        </span>
+        {#if showOptTicks}
+          <span class="k" title="the cost-optimal value for this technology">
+            <svg viewBox="0 0 22 10" aria-hidden="true">
+              <line x1="11" y1="0.5" x2="11" y2="9.5" stroke="var(--tick)" stroke-width="2" opacity="0.85" />
+            </svg>optimum
+          </span>
+        {/if}
+      </div>
+
     </section>
+  {/if}
+
+  {#if tourOpen}
+    <Tour steps={tourSteps} step={tourStep} onstep={gotoTourStep} onclose={endTour} />
   {/if}
 </div>
 {/if}
 
 <style>
-  .stage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
-
-  .hud { position: absolute; z-index: 2; }
-  .panel {
-    background: rgba(16, 21, 28, 0.72);
-    border: 1px solid rgba(255, 255, 255, 0.07);
-    border-radius: 16px;
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(10px);
+  /* Two bands: a full-width graph over a full-width Profiles panel. These four
+     numbers are the whole layout — they used to be copy-pasted into .graph-region
+     and .pc-panel separately (and drifted). --graph-top = topbar 16+48+16. */
+  /* Profiles rail left, graph right. These four numbers are the whole layout —
+     they used to be copy-pasted per rule and drifted. --graph-top = 16+48+16. */
+  .stage {
+    position: relative; flex: 1; min-height: 0; overflow: hidden;
+    --edge: 16px; --bar-h: 60px; --graph-top: calc(var(--bar-h) + var(--edge));
+    --rail-w: 348px;
+    --graph-left: calc(var(--rail-w) + var(--edge) * 2);
   }
 
+  .hud { position: absolute; z-index: 2; }
+  /* Frosted glass, no cast shadow. With the drop shadow gone the only things
+     separating a panel from what is behind it are the blur, the wash and the
+     border — so the blur is heavy and the border does real work. `saturate` is
+     what makes it read as frost rather than as a grey veil: it keeps the colour
+     of whatever is underneath alive instead of washing it to neutral. */
+  .panel {
+    background: var(--panel-glass);
+    border: 1px solid var(--b-12);
+    border-radius: 16px;
+    backdrop-filter: blur(22px) saturate(180%);
+    -webkit-backdrop-filter: blur(22px) saturate(180%);
+  }
+
+  /* Pinned flush to the top edge and square: it is chrome, not a floating card,
+     and a rounded panel inset by 16px left a strip of page showing above it that
+     read as a gap once the background went flat. Overrides .panel's radius. */
   .topbar {
-    top: 16px; left: 16px; right: 16px; height: 48px; z-index: 4;
-    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 16px;
-    padding: 0 18px;
+    top: 0; left: 0; right: 0; height: var(--bar-h); z-index: 4;
+    display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 20px;
+    padding: 0 22px;
+    border-radius: 0;
+    border-width: 0 0 1px;
+  }
+  .bar-right {
+    display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0;
   }
   /* center column keeps the view selector fixed regardless of the side text widths */
   .view-seg { flex: none; justify-self: center; }
-  .view-seg button { padding: 4px 16px; font-size: 12px; }
+  .view-seg button { padding: 6px 20px; font-size: 12.5px; }
   .star-box {
     display: flex; justify-content: center; padding: 4px 0;
-    border: 1px dashed rgba(45, 212, 191, 0.25); border-radius: 12px;
+    border: 1px dashed color-mix(in srgb, var(--accent) 25%, transparent); border-radius: 12px;
   }
-  h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  h1 small { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
-  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-  .change-ds {
-    flex: none; font-size: 11px; padding: 3px 9px; border-radius: 7px; white-space: nowrap;
-    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+  h1 { font-size: 19px; margin: 0; font-weight: 600; flex: none; letter-spacing: -0.01em; }
+  .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+  /* the only thing here allowed to shrink: an uploaded polytope can have a long
+     name, and it must not push the icon buttons off the bar */
+  .ds-chip {
+    display: flex; align-items: center; gap: 8px; min-width: 0;
+    font-size: 11.5px; padding: 5px 11px; border-radius: 8px;
+    background: var(--s-05); border: 1px solid var(--b-12);
+    color: var(--muted); cursor: pointer; backdrop-filter: blur(6px);
+  }
+  .ds-chip:hover { background: var(--s-09); color: var(--fg); border-color: var(--accent); }
+  .ds-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 26ch; }
+  .ds-n {
+    flex: none; font-variant-numeric: tabular-nums; font-size: 10px;
+    padding: 0 5px; border-radius: 999px;
+    background: var(--s-09); color: var(--muted);
+  }
+  /* subordinate to the chip on purpose — square, icon-only, no border until hover */
+  .icon-btn {
+    flex: none; width: 32px; height: 32px; padding: 0; border-radius: 9px;
+    display: grid; place-items: center; font-size: 16px; line-height: 1;
+    background: var(--s-05); border: 1px solid transparent;
     color: var(--muted); cursor: pointer;
   }
-  .change-ds:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); border-color: var(--accent); }
-  .change-ds.on { border-color: var(--accent); color: var(--accent); }
+  .icon-btn:hover { background: var(--s-09); color: var(--fg); border-color: var(--b-20); }
+  .icon-btn.on { border-color: var(--accent); color: var(--accent); background: var(--s-05); }
 
-  /* settings popover, anchored under the top bar (left) */
+  /* Anchored under its own button, which now lives at the bar's right end. It
+     shares that corner with `.layers-pop` — harmless, because showSettings and
+     showLayers are mutually exclusive — and covers the `▤ layers` button while
+     open, which is fine for a transient panel the user just asked for. */
   .settings-pop {
-    top: 76px; left: 16px; width: 244px; z-index: 6;
+    top: calc(var(--bar-h) + 8px); right: var(--edge); width: 264px; z-index: 7;
     display: flex; flex-direction: column; gap: 14px; padding: 14px 16px;
-    max-height: calc(100% - 96px); overflow-y: auto;
+    max-height: calc(100% - var(--bar-h) - 24px); overflow-y: auto;
   }
   .settings-head {
     display: flex; align-items: center; justify-content: space-between;
     font-size: 13px; color: var(--fg);
   }
   .set-sect { display: flex; flex-direction: column; gap: 6px;
-    border-top: 1px solid #2a3441; padding-top: 12px; }
+    border-top: 1px solid var(--rule); padding-top: 12px; }
   .set-sect:first-of-type { border-top: none; padding-top: 0; }
   .set-label { display: flex; align-items: center; justify-content: space-between;
     font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
   .set-actions { display: flex; gap: 8px; }
-  .check.dim { text-transform: capitalize; }
+  .check.dim { font-variant-numeric: tabular-nums; }
   .range-row { flex-direction: row; align-items: center; gap: 10px; }
   .range-row input { flex: 1; accent-color: var(--accent); }
   .range-val { font-size: 12px; color: var(--fg); min-width: 16px; text-align: right; }
-  .topbar-hint { color: var(--muted); font-size: 12px; text-align: right; min-width: 0; line-height: 1.15; }
+  .topbar-hint {
+    color: var(--muted); font-size: 11.5px; text-align: right; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
   .graph-region {
     position: absolute; z-index: 1;
-    top: 80px; left: 252px; right: 16px; bottom: 232px;
+    top: var(--graph-top); left: var(--graph-left); right: var(--edge); bottom: var(--edge);
+  }
+  /* Map only: edge to edge, under the bar and the rail. The Coupling matrix must
+     NOT do this — it is discrete cells, and half a column behind a panel is
+     unreadable in a way a point cloud is not. */
+  .graph-region.bleed { top: 0; left: 0; right: 0; bottom: 0; }
+  .map-labels {
+    position: absolute; z-index: 2; pointer-events: none;
+    top: var(--graph-top); left: var(--graph-left); right: var(--edge); bottom: var(--edge);
   }
   /* Coupling view: matrix alone by default; when a cell is clicked the facet
      panel docks into the right half and the matrix keeps the left half. */
@@ -1558,7 +1899,7 @@
   .cpl-facet {
     flex: 1 1 50%; min-width: 0; min-height: 0;
     display: flex; flex-direction: column; gap: 6px;
-    border-left: 1px solid rgba(255, 255, 255, 0.08); padding-left: 14px;
+    border-left: 1px solid var(--b-08); padding-left: 14px;
   }
   .cpl-facet-head { flex: none; display: flex; align-items: center; gap: 8px; }
   .cpl-facet-title {
@@ -1568,133 +1909,80 @@
   }
   .cpl-full {
     flex: none; font-size: 11px; padding: 3px 9px; border-radius: 7px; line-height: 1.3;
-    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    background: var(--s-05); border: 1px solid var(--b-12);
     color: var(--muted); cursor: pointer; white-space: nowrap;
   }
-  .cpl-full:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--accent); color: var(--fg); }
+  .cpl-full:hover { background: var(--s-09); border-color: var(--accent); color: var(--fg); }
   .cpl-facet-body { flex: 1; min-height: 0; position: relative; }
+  /* facet shape verdict — the taxonomy's plain-language payoff, next to the
+     outline it describes (see generate.py `classify_facet`) */
+  .shape-tag {
+    display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+    font-size: 9.5px; letter-spacing: 0.04em; text-transform: none;
+    color: var(--c); background: color-mix(in srgb, var(--c) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--c) 55%, transparent);
+  }
+  .shape-detail { flex: none; margin: 0; font-size: 11.5px; color: var(--fg); }
   .cpl-close {
     flex: none; display: flex; align-items: center; justify-content: center;
     width: 22px; height: 22px; border-radius: 6px; padding: 0; font-size: 12px; line-height: 1;
-    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    background: var(--s-05); border: 1px solid var(--b-12);
     color: var(--muted); cursor: pointer;
   }
-  .cpl-close:hover { background: rgba(255, 255, 255, 0.1); color: var(--fg); }
+  .cpl-close:hover { background: var(--s-09); color: var(--fg); }
   .ylabel {
+    text-shadow: 0 1px 6px var(--shadow-text);
     position: absolute; left: 0; top: 50%;
     transform: translateY(-50%) rotate(180deg); writing-mode: vertical-rl;
     font-size: 12px; color: var(--accent); white-space: nowrap; pointer-events: none;
-    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.95);
   }
   .xlabel {
+    text-shadow: 0 1px 6px var(--shadow-text);
     position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
     font-size: 12px; color: var(--accent); white-space: nowrap; pointer-events: none;
-    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.95);
   }
 
-  aside.panel {
-    top: 80px; left: 16px; bottom: 16px; width: 220px;
-    display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
-    padding: 16px;
+  /* Map projection + overlay popover, anchored under its own button. Shares the
+     .settings-pop corner, so the two are mutually exclusive (see showLayers). */
+  /* graph's top-right corner — the rail owns the left edge, and the compare tray
+     takes the graph's top-left */
+  .map-tool {
+    position: absolute; z-index: 6;
+    top: var(--graph-top); right: var(--edge);
+    font-size: 11px; padding: 5px 12px; border-radius: 8px;
+    background: var(--panel-glass); border: 1px solid var(--b-12);
+    color: var(--muted); cursor: pointer;
   }
-  .sect {
-    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--muted); border-top: 1px solid #2a3441; padding-top: 10px; margin-top: 2px;
+  .map-tool.on { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+  .layers-pop {
+    top: calc(var(--graph-top) + 40px); right: var(--edge);
+    width: 244px; z-index: 6;
+    display: flex; flex-direction: column; gap: 14px; padding: 14px 16px;
+    max-height: calc(100% - var(--graph-top) - 60px); overflow-y: auto;
   }
+  .layers-pop .wide { width: 100%; margin-top: 2px; }
+  .row-label { gap: 6px; font-size: 11px; color: var(--muted); }
   .check { flex-direction: row; align-items: center; gap: 6px; color: var(--fg); }
   .check.dis { opacity: 0.45; }
-  /* slice / sweep */
-  /* slice sweep slider spans the feasible range; the sampled sub-range is shaded */
-  .slice-track { position: relative; height: 18px; display: flex; align-items: center; }
-  .slice-base { position: absolute; left: 0; right: 0; height: 4px; border-radius: 2px; background: #2a3441; }
-  .slice-sampled { position: absolute; height: 4px; border-radius: 2px; background: rgba(232, 121, 249, 0.5); }
-  .slice-slider {
-    position: relative; z-index: 1; width: 100%; margin: 0;
-    -webkit-appearance: none; appearance: none; background: transparent;
-  }
-  .slice-slider::-webkit-slider-runnable-track { height: 4px; background: transparent; }
-  .slice-slider::-moz-range-track { height: 4px; background: transparent; }
-  .slice-slider::-webkit-slider-thumb {
-    -webkit-appearance: none; appearance: none;
-    width: 12px; height: 12px; border-radius: 50%; background: #e879f9;
-    margin-top: -4px; cursor: pointer; box-shadow: 0 0 0 2px rgba(10, 14, 20, 0.6);
-  }
-  .slice-slider::-moz-range-thumb {
-    width: 12px; height: 12px; border: none; border-radius: 50%; background: #e879f9; cursor: pointer;
-  }
-  .slice-info { font-size: 12px; color: var(--fg); }
-  .slice-info strong { color: #e879f9; }
-  .slice-tail { color: #f0a14e; font-size: 11px; }
-  .slice-legend { color: #e879f9; }
-  .slice-w { font-size: 11px; color: var(--muted); }
-  .slice-w input { width: 100%; accent-color: #e879f9; }
-  /* dataset readout */
-  .data-box { display: flex; flex-direction: column; gap: 6px; }
   .data-name {
     font-size: 11px; color: var(--fg); line-height: 1.3;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  /* consequences (§4) */
-  .cons-vol {
-    display: flex; flex-direction: column; gap: 1px;
-    padding: 4px 8px; border-radius: 6px;
-    background: rgba(45, 212, 191, 0.07); border-left: 3px solid var(--accent);
-  }
-  .vol-num { font-size: 13px; color: var(--fg); font-weight: 600; }
-  .vol-ci { font-size: 10px; color: var(--muted); }
-  .cons-item {
-    font-size: 12px; padding: 3px 8px; border-radius: 6px; border-left: 3px solid;
-    background: rgba(255, 255, 255, 0.03);
-  }
-  .cons-item.force { border-color: #f4b43c; }
-  .cons-item.include { border-color: #e64a3b; }
-  .cons-item.limit { border-color: #2e8cdc; }
-  .cons-bad { color: #e64a3b; font-size: 13px; }
-  .cons-note {
-    font-size: 11px; color: var(--muted); font-style: italic; line-height: 1.3;
-    border-left: 3px solid rgba(45, 212, 191, 0.5); padding: 2px 8px;
-  }
-  .info { margin-top: 4px; font-size: 13px; }
-  .info p { margin: 4px 0; }
   .muted { color: var(--muted); }
 
-  .mode { display: flex; flex-direction: column; gap: 4px; }
-  .mode-label { font-size: 12px; color: var(--muted); }
   .seg { display: flex; }
   .seg button { flex: 1; border-radius: 0; }
   .seg button:first-child { border-radius: 6px 0 0 6px; }
   .seg button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
-  .seg button.active { background: var(--accent); color: #06241f; border-color: var(--accent); font-weight: 600; }
-  .sel-info { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .seg button.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
   .link { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; text-decoration: underline; }
 
-  .gen { display: flex; flex-direction: column; gap: 8px; }
-  .cons-add { display: flex; flex-direction: column; gap: 6px; }
-  .cons-row { display: flex; gap: 6px; }
-  .cons-row input { width: 100%; min-width: 0; }
-  .cons-row .add { flex: none; width: 32px; padding: 0; font-size: 16px; }
-  input[type="number"] {
-    background: var(--panel); color: var(--fg); border: 1px solid #30363d;
-    border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 100%;
-  }
-  .n-row { flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 12px; }
-  .n-row input { width: 78px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
-  .chip {
-    display: inline-flex; align-items: center; gap: 5px; font-size: 11px;
-    background: #20303a; border: 1px solid #2f4a52; color: var(--fg);
-    border-radius: 999px; padding: 2px 4px 2px 8px;
-  }
-  .chip.brush { background: #1b2a33; border-style: dashed; color: var(--muted); padding-right: 8px; }
-  .chip button { background: none; border: none; color: var(--muted); cursor: pointer; padding: 0 2px; font-size: 13px; line-height: 1; }
-  .chip button:hover { color: #f85149; }
-  .primary { background: var(--accent); color: #06241f; border-color: var(--accent); font-weight: 600; }
-  .primary:disabled { opacity: 0.6; cursor: default; }
-  .err-msg { color: #f0a14e; font-size: 11px; }
   .small { font-size: 11px; }
 
   .gen-banner {
-    top: 76px; left: 50%; transform: translateX(-50%); z-index: 5;
+    /* centred on the GRAPH, not the window — the rail takes the left third */
+    top: 76px; left: calc((var(--graph-left) + 100% - var(--edge)) / 2);
+    transform: translateX(-50%); z-index: 5;
     display: flex; align-items: center; gap: 14px; padding: 8px 14px; font-size: 13px;
   }
   .gen-banner .dot {
@@ -1702,46 +1990,102 @@
     background: var(--accent); margin-right: 7px; box-shadow: 0 0 8px var(--accent);
   }
 
-  /* compare tray */
+  /* Pinned designs: the graph's top-RIGHT, directly under the ▤ layers button and
+     sharing its right edge, so the two read as one column of map controls instead
+     of one floating in each top corner. `.layers-pop` opens into the same slot and
+     covers the tray while open — fine, it is a transient menu, and the two buttons
+     that open them are mutually exclusive anyway. */
   .tray {
-    top: 80px; right: 16px; width: 232px; max-height: calc(100% - 330px);
+    top: calc(var(--graph-top) + 40px); right: var(--edge); width: 244px;
+    max-height: calc(100% - var(--graph-top) - var(--edge) - 48px);
     overflow-y: auto; z-index: 3;
     display: flex; flex-direction: column; gap: 10px; padding: 12px 14px;
   }
   .tray-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--fg); font-weight: 600; }
   .card {
-    border: 1px solid rgba(255, 255, 255, 0.08); border-left: 3px solid var(--pc);
+    border: 1px solid var(--b-08); border-left: 3px solid var(--pc);
     border-radius: 10px; padding: 8px 10px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--s-02);
   }
-  .card:hover { background: rgba(255, 255, 255, 0.05); }
+  .card:hover { background: var(--s-05); }
   .card-head { display: flex; align-items: center; gap: 7px; font-size: 12px; }
   .badge {
     width: 17px; height: 17px; border-radius: 50%; background: var(--pc);
-    color: #0a0e14; font-size: 10px; font-weight: 800; line-height: 17px; text-align: center; flex: none;
+    color: var(--on-accent); font-size: 10px; font-weight: 800; line-height: 17px; text-align: center; flex: none;
   }
   .card-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .x { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0 2px; }
-  .x:hover { color: #f85149; }
+  .x:hover { color: var(--danger); }
   .card-body { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
   .card-actions { display: flex; flex-direction: column; gap: 6px; }
   .mini {
     font-size: 11px; padding: 3px 8px; border-radius: 6px;
   }
-  .mini.active { background: var(--accent); color: #0b0f14; border-color: var(--accent); }
-  .morph { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid #2a3441; padding-top: 8px; }
+  .mini.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .morph { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--rule); padding-top: 8px; }
   .morph-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
   .morph input[type="range"] { width: 100%; accent-color: var(--accent); }
   .morph-glyph { display: flex; flex-direction: column; align-items: center; gap: 2px; }
   .morph-cap { text-align: center; }
 
+  /* Profiles rail: head · constraints block · rows · consequence strip. Only the
+     rows flex — everything else is intrinsic, so the plot absorbs the slack. */
   .pc-panel {
-    left: 252px; right: 16px; bottom: 16px; height: 200px;
+    top: var(--graph-top); left: var(--edge); bottom: var(--edge); width: var(--rail-w);
     display: flex; flex-direction: column; gap: 6px;
-    padding: 12px 16px;
+    padding: 14px 16px 10px;
   }
-  .pc-head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--fg); }
-  .pc-body { flex: 1; min-height: 0; }
+  .pc-head {
+    flex: none; height: 34px; overflow: hidden;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+    font-size: 11.5px; color: var(--fg);
+  }
+  /* The rows are the point of this panel, so everything else is trimmed to the
+     smallest fixed height that still holds its content, and .pc-body takes the
+     rest. The fixed heights are load-bearing — see the note below. */
+  .pc-body { flex: 1; min-height: 120px; }
+  /* FIXED heights, not just `flex: none`. Anything here that grows when you
+     select or constrain steals height from .pc-body, which resizes the canvas and
+     makes every violin jump. Overflow is handled inside each block. */
+  .vol-slot {
+    flex: none; height: 38px; overflow: hidden; position: relative;
+    border-bottom: 1px solid var(--rule); padding-bottom: 2px;
+  }
+  /* No rule above it: it belongs to the rows, and a full-width border made it
+     look like a separate footer block. It is indented to the rows' label gutter
+     instead, which ties it to them without drawing a line. */
+  .lim-slot {
+    flex: none; height: 38px; overflow-y: auto; overflow-x: hidden;
+    padding-left: 2px;
+  }
+  .lim-slot { scrollbar-width: none; }
+  .lim-slot::-webkit-scrollbar { display: none; }
+  /* mark key, directly under the rows it describes */
+  .pc-key {
+    flex: none; height: 26px; overflow: hidden;
+    display: flex; flex-wrap: nowrap; align-items: center;
+    gap: 9px; font-size: 10px; color: var(--muted);
+    border-top: 1px solid var(--rule); padding-top: 6px;
+  }
+  .pc-key .k { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex: none; }
+  .pc-key svg { width: 18px; height: 10px; flex: none; overflow: visible; }
+
+  .pc-key {
+    flex: none; height: 26px; overflow: hidden;
+    display: flex; flex-wrap: nowrap; align-items: center;
+    gap: 9px; font-size: 10px; color: var(--muted);
+    border-top: 1px solid var(--rule); padding-top: 6px;
+  }
+  .pc-key .k { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex: none; }
+  .pc-key svg { width: 18px; height: 10px; flex: none; overflow: visible; }
+
+  .pc-title { display: flex; align-items: center; gap: 5px; min-width: 0; }
+  .pc-legend { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+  .pc-legend .ramp { width: 44px; height: 8px; }
+  .ramp-ends { font-size: 10px; font-variant-numeric: tabular-nums; }
+  /* the two view options share one line and take the head's full width, so the
+     head settles at two lines instead of four in a 320px rail */
+  .head-opts { flex-basis: 100%; display: flex; gap: 12px; }
 
   /* shown for the one round-trip that checks whether a stored session is still
      alive — without it the landing page flashes before the dataset comes back */
@@ -1753,21 +2097,25 @@
     position: absolute; inset: 0; z-index: 1;
     display: grid; place-items: center; color: var(--muted); font-size: 14px;
   }
-  .overlay.err { color: #f85149; }
+  .overlay.err { color: var(--danger); }
 
+  /* OPAQUE, both themes. This read `background: var(--on-accent)f2` — token
+     concatenation, which is fragile (it only parses at all because both values
+     happen to be 6-digit hex) and semantically wrong: --on-accent is the *text*
+     colour for accent fills, so in dark mode the tooltip was a dark GREEN card at
+     95%, sitting over a dense teal point cloud that showed straight through it.
+     --panel-solid is the token that actually means "an opaque panel per theme". */
   .tooltip {
+    box-shadow: var(--shadow-md);
     position: absolute; pointer-events: none; z-index: 50;
-    background: #0b0f14f2; border: 1px solid #30363d; border-radius: 8px;
+    background: var(--panel-solid); border: 1px solid var(--b-20); border-radius: 8px;
     padding: 8px 10px; font-size: 11px; min-width: 150px;
-    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(3px);   /* --panel-solid is 97/98%, not 100 */
   }
   .tt-title { color: var(--accent); font-weight: 600; margin-bottom: 4px; }
   .tt-row { display: flex; justify-content: space-between; gap: 14px; color: var(--fg); }
   .tt-row span:first-child { color: var(--muted); }
-  .tt-row.cost { margin-top: 4px; padding-top: 4px; border-top: 1px solid #30363d; font-weight: 600; }
+  .tt-row em { color: var(--muted); font-style: normal; font-size: 10px; }
 
-  .legend { margin-top: 6px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
-  .legend-title { color: var(--muted); }
-  .ramp { height: 12px; border-radius: 3px; background: linear-gradient(90deg, #45337a, #3a51a8, #228c8c, #5fbf61, #fce824); }
-  .ramp-labels { display: flex; justify-content: space-between; color: var(--muted); }
+  .ramp { height: 12px; border-radius: 3px; }
 </style>

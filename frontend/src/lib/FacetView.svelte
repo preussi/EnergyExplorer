@@ -15,6 +15,7 @@
     activeFields = [],
     colorValues = [],
     colorCategorical = false,
+    theme = "dark",
     colorMin = 0,
     colorMax = 1,
     constraints = [],
@@ -28,6 +29,8 @@
     activeFields?: string[];            // dimensions enabled in Settings ([] = all)
     colorValues?: number[];
     colorCategorical?: boolean;
+    /** selects the mark ramp and forces a canvas repaint */
+    theme?: "dark" | "light";
     colorMin?: number;
     colorMax?: number;
     constraints?: ConstraintInput[];
@@ -196,13 +199,14 @@
       const isSel = !selSet || selSet.has(r);
       ctx.globalAlpha = isSel ? 0.5 : 0.06;
       ctx.fillStyle = colorValues.length
-        ? colorFor(colorValues[r], colorMin, colorMax, colorCategorical)
+        ? colorFor(colorValues[r], colorMin, colorMax, colorCategorical, theme)
         : "#8b949e";
       ctx.fillRect(x - 1.1, y - 1.1, 2.2, 2.2);
     }
     ctx.globalAlpha = 1;
   });
 
+  let howto = $state(false);
 </script>
 
 <div class="facets">
@@ -247,13 +251,25 @@
       {/if}
     </div>
     <p class="caption muted">
-      solid outline = exact boundary of the near-optimal space (LP shadow) · dots = sampled designs (rarely reach the extreme corners, so the violins below look narrower) · teal = under your constraints · ◯ = optimum
+      <button class="info" class:on={howto} aria-label="how to read this facet"
+              title="how to read this" onclick={() => (howto = !howto)}>i</button>
+      {#if howto}
+        solid outline = exact boundary of the near-optimal space (LP shadow) · dots =
+        sampled designs (they rarely reach the extreme corners, which is why the
+        violins look narrower) · teal = under your constraints · ◯ = optimum
+      {/if}
     </p>
   </div>
 
 </div>
 
 <style>
+  .info {
+    width: 15px; height: 15px; padding: 0; border-radius: 50%; vertical-align: middle;
+    font-size: 9.5px; font-style: italic; font-weight: 700; line-height: 1;
+    background: var(--s-05); border: 1px solid var(--b-20); color: var(--muted); cursor: pointer;
+  }
+  .info.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   .facets { display: flex; width: 100%; height: 100%; min-height: 0; }
   .main { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
   .plot { position: relative; flex: 1; min-height: 0; }
@@ -263,28 +279,28 @@
   .swap {
     position: absolute; top: 8px; right: 8px; z-index: 2;
     font-size: 11px; padding: 3px 9px; border-radius: 7px;
-    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12);
+    background: var(--s-05); border: 1px solid var(--b-12);
     color: var(--fg); cursor: pointer;
   }
-  .swap:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--accent); }
+  .swap:hover { background: var(--s-09); border-color: var(--accent); }
 
   .base-poly {
-    fill: rgba(255, 255, 255, 0.025);
-    stroke: rgba(255, 255, 255, 0.75); stroke-width: 1.6;
-    filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.25));
+    fill: var(--s-02);
+    stroke: var(--tick); stroke-width: 1.6;
   }
   .cons-poly {
-    fill: rgba(45, 212, 191, 0.10);
+    filter: drop-shadow(0 0 6px color-mix(in srgb, var(--accent) 50%, transparent));
+    fill: color-mix(in srgb, var(--accent) 10%, transparent);
     stroke: var(--accent); stroke-width: 1.8;
-    filter: drop-shadow(0 0 6px rgba(45, 212, 191, 0.5));
   }
-  .opt { fill: #fff; stroke: rgba(0, 0, 0, 0.7); stroke-width: 1.5; }
+  .opt {
+    filter: drop-shadow(0 0 5px var(--tick)); fill: var(--tick); stroke: var(--halo); stroke-width: 1.5; }
   .tick { fill: var(--muted); font-size: 10px; }
   .tick.end { text-anchor: end; }
   .axis-lbl { fill: var(--accent); font-size: 12px; }
   .empty-note {
     position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
-    color: #f0a14e; font-size: 12px; background: rgba(10, 14, 20, 0.8);
+    color: var(--warn); font-size: 12px; background: var(--panel-glass);
     border-radius: 8px; padding: 4px 10px;
   }
   .caption { font-size: 11px; margin: 6px 0 0; text-align: center; }

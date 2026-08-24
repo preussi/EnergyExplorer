@@ -7,6 +7,8 @@ from the Chebyshev center LP.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from scipy.optimize import linprog
 
@@ -104,6 +106,116 @@ def _slot(ds, key: str, default):
     return ds.cache.setdefault(key, default)
 
 
+# ---- facet shape taxonomy -------------------------------------------------
+# A facet is an orthogonal projection of a convex body, so it is ALWAYS convex:
+# no holes, no reflex vertices. Its bounding box is tight, so it touches all four
+# sides. The only structural freedom left is therefore *which corners of the box
+# it cannot reach* — which makes this classification complete rather than ad hoc.
+#
+# Normalizing by the facet's own bounding box makes the measure scale-free, so a
+# GW x GW pair and a GW x ktCO2/h pair are directly comparable.
+#
+#   g_UR > 0  can't both be HIGH        -> trade-off
+#   g_LL > 0  can't both be LOW         -> at least one is required
+#   g_LR > 0  x high with y low is out  -> x REQUIRES y   (directional!)
+#   g_UL > 0  y high with x low is out  -> y REQUIRES x
+#
+# The diagonals say different things: {LL,UR} constrains the sum, {UL,LR} the
+# difference.
+CORNERS = {"LL": (0.0, 0.0), "LR": (1.0, 0.0), "UL": (0.0, 1.0), "UR": (1.0, 1.0)}
+# Below this a cut corner is not visually distinguishable from a box. Calibrated
+# on polytope_13: the near-box pairs top out at 0.11, the trade-offs start at 0.25.
+GAP_EPS = 0.15
+
+
+def _cheb_to_segment(p, q, c) -> float:
+    """min over the segment p->q of the Chebyshev distance to point c.
+
+    Convex in the segment parameter, so ternary search converges to machine
+    precision in a fixed number of steps (no sampling artefacts)."""
+    def f(t: float) -> float:
+        return max(abs(p[0] + (q[0] - p[0]) * t - c[0]),
+                   abs(p[1] + (q[1] - p[1]) * t - c[1]))
+    lo, hi = 0.0, 1.0
+    for _ in range(80):
+        m1, m2 = lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0
+        if f(m1) < f(m2):
+            hi = m2
+        else:
+            lo = m1
+    return float(f((lo + hi) / 2.0))
+
+
+def _inside(pt, poly) -> bool:
+    """Ray-cast point-in-polygon (the polygon is convex and closed)."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    for k in range(n):
+        x1, y1 = poly[k]
+        x2, y2 = poly[(k + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < xi:
+                inside = not inside
+    return inside
+
+
+def corner_gaps(poly) -> dict[str, float] | None:
+    """Chebyshev gap from each bounding-box corner to the facet, on the facet
+    normalized into the unit square. 0 = that corner is attainable."""
+    if poly is None or len(poly) < 3:
+        return None
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 <= 0 or y1 - y0 <= 0:
+        return None
+    N = [((p[0] - x0) / (x1 - x0), (p[1] - y0) / (y1 - y0)) for p in poly]
+    out = {}
+    for name, c in CORNERS.items():
+        if _inside(c, N):
+            out[name] = 0.0
+        else:
+            out[name] = min(_cheb_to_segment(N[k], N[(k + 1) % len(N)], c)
+                            for k in range(len(N)))
+    return out
+
+
+def classify_facet(gaps, x_axis: str, y_axis: str) -> dict:
+    """Label a facet from its corner gaps. `band` and `locked` do not occur in
+    polytope_13 (epsilon=0.1 is generous) but are detected so a tighter or
+    uploaded polytope isn't mislabelled as one of the simple cases."""
+    if not gaps:
+        return {"category": "unknown", "strength": 0.0, "cut": [], "detail": ""}
+    hot = {k: v for k, v in gaps.items() if v >= GAP_EPS}
+    strength = max(hot.values()) if hot else 0.0
+    cut = sorted(hot, key=lambda k: -hot[k])
+    sx, sy = x_axis, y_axis
+    if not hot:
+        return {"category": "independent", "strength": 0.0, "cut": [],
+                "detail": f"{sx} and {sy} can be chosen independently"}
+    if "LL" in hot and "UR" in hot:
+        return {"category": "band", "strength": strength, "cut": cut,
+                "detail": f"{sx} and {sy} substitute one-for-one — their total is pinned"}
+    if "LR" in hot and "UL" in hot:
+        return {"category": "locked", "strength": strength, "cut": cut,
+                "detail": f"{sx} and {sy} have to move together"}
+    top = cut[0]
+    if top == "UR":
+        return {"category": "tradeoff", "strength": strength, "cut": cut,
+                "detail": f"{sx} and {sy} cannot both be large"}
+    if top == "LL":
+        return {"category": "at_least_one", "strength": strength, "cut": cut,
+                "detail": f"{sx} and {sy} cannot both be small — at least one is required"}
+    # dependency is DIRECTIONAL: which one needs the other is the useful part
+    needs, needed = (sx, sy) if top == "LR" else (sy, sx)
+    return {"category": "dependency", "strength": strength, "cut": cut,
+            "needs": needs, "needed": needed,
+            "detail": f"{needs} at scale requires {needed}"}
+
+
 def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
     """Exact 2-D shadow (orthogonal projection) of the (optionally constrained)
     polytope onto two axes, via support-function LPs: for each direction theta,
@@ -164,25 +276,57 @@ def shadow(ds, x_axis: str, y_axis: str, constraints=None, n_dirs: int = 72):
         [float(p[0] * ds._scale[i] + ds._offset[i]), float(p[1] * ds._scale[j] + ds._offset[j])]
         for p in poly
     ]
-    result = {**base, "feasible": True, "polygon": poly_phys, "boxiness": boxiness}
+    gaps = corner_gaps(poly_phys)
+    shape = classify_facet(gaps, x_axis, y_axis)
+    result = {**base, "feasible": True, "polygon": poly_phys, "boxiness": boxiness,
+              "corner_gaps": gaps, "shape": shape}
     if key is not None:
         shadows[key] = result
     return result
 
 
-def shadow_pairs(ds):
-    """All 36 axis pairs (C(9,2)) ranked by 'interestingness' (1 - boxiness of the
-    exact shadow). Expensive on first call (~36x72 LPs), cached afterwards."""
+def shadow_pairs(ds, budget_s: float = 25.0):
+    """Every axis pair (C(n,2)) with its exact shadow: boxiness, corner gaps, shape
+    and the polygon itself.
+
+    The polygon rides along so the matrix can draw all its mini-outlines from ONE
+    response. It used to fetch them per pair — 36 requests at 9 axes, but 276 at the
+    24-axis cap, which is a request storm for data we already have here.
+
+    **Bounded.** This is the quadratic term of a build: 36 pairs ≈ 2.4 s, but 276
+    ≈ 47 s. Pairs are computed most-coupled-first (so the interesting ones are
+    ready) until `budget_s` is spent; the rest come back `pending` and are filled in
+    on demand by `/api/shadow`, which caches into the same slot.
+    """
     cached = ds.cache.get("shadow_pairs")
     if cached is not None:
         return cached
-    out = []
-    for i in range(len(ds.axes)):
-        for j in range(i + 1, len(ds.axes)):
-            s = shadow(ds, ds.axes[i], ds.axes[j])
-            out.append({"x": ds.axes[i], "y": ds.axes[j], "boxiness": s["boxiness"]})
+
+    n = len(ds.axes)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    # most-coupled first, when dependence is already warm (it is: _warm runs it first)
+    dep = ds.cache.get("dependence", {}).get("chrrt")
+    if dep and dep.get("dcor"):
+        D = dep["dcor"]
+        pairs.sort(key=lambda ij: -D[ij[0]][ij[1]])
+
+    out, t0, spent = [], time.perf_counter(), False
+    for i, j in pairs:
+        x, y = ds.axes[i], ds.axes[j]
+        if spent:
+            out.append({"x": x, "y": y, "boxiness": None, "corner_gaps": None,
+                        "shape": None, "polygon": None, "pending": True})
+            continue
+        s_ = shadow(ds, x, y)
+        out.append({"x": x, "y": y, "boxiness": s_["boxiness"],
+                    "corner_gaps": s_.get("corner_gaps"), "shape": s_.get("shape"),
+                    "polygon": s_.get("polygon"), "pending": False})
+        if time.perf_counter() - t0 > budget_s:
+            spent = True
     out.sort(key=lambda e: e["boxiness"] if e["boxiness"] is not None else 1.0)
-    ds.cache["shadow_pairs"] = out
+    # only cache a COMPLETE sweep: a truncated one would freeze the pending pairs
+    if not spent:
+        ds.cache["shadow_pairs"] = out
     return out
 
 
@@ -295,95 +439,6 @@ def flexibility(ds, constraints=None):
     return result
 
 
-def volume_ratio(ds, constraints, seed: int = 42, pop: int = 4000,
-                 p0: float = 0.1, max_levels: int = 12):
-    """Relative volume of the constrained region vs the full near-optimal space:
-    ``vol({Ax<=b} ∩ box) / vol({Ax<=b})`` — i.e. "how much of the design space
-    survives these constraints".
-
-    The uniform-sample fraction (computed client-side) answers this directly when
-    the region is not too small, but lands *zero* points once the region drops
-    below ~1/N of the volume — exactly the tail the user cares about. This is a
-    **subset-simulation** (multilevel-splitting) estimator that stays accurate
-    there, reusing the same hit-and-run sampler.
-
-    The box is the extra halfspaces ``r·x <= β`` (from :func:`build_constraints`).
-    Define a normalized violation ``h(x) = max_r (r·x - β_r)/scale_r``; the target
-    region is ``{h <= 0}``. We lower an intermediate threshold ``h_ℓ`` level by
-    level so each conditional probability is ≈ ``p0``, drawing hit-and-run samples
-    restricted to ``{Ax<=b, r·x <= β_r + h_ℓ·scale_r}`` (still a polytope), and
-    multiply the per-level conditionals. Reaching 1e-8 takes ~8 levels, not the
-    ~1e8 samples a naive count would need.
-    """
-    rows, bnds = build_constraints(ds, constraints or [])
-    if not rows:
-        return {"feasible": True, "ratio": 1.0, "log10": 0.0, "levels": 0,
-                "method": "trivial", "cv": 0.0}
-    R = np.asarray(rows, dtype=float)          # (q, n) box halfspaces
-    beta = np.asarray(bnds, dtype=float)       # (q,)
-    A0, b0 = ds.A, ds.b
-    n = A0.shape[1]
-    bounds = [(None, None)] * n
-
-    # non-empty target? (thin slabs have ~0 inscribed radius but are still feasible)
-    x0t, _ = chebyshev_center(np.vstack([A0, R]), np.concatenate([b0, beta]))
-    if x0t is None:
-        return {"feasible": False, "ratio": 0.0, "log10": None, "levels": 0,
-                "method": "empty", "cv": 0.0}
-
-    # per-row violation scale = max positive excess of that row over the base body
-    scale = np.empty(len(R))
-    for k in range(len(R)):
-        res = linprog(-R[k], A_ub=A0, b_ub=b0, bounds=bounds, method="highs")
-        excess = (-float(res.fun) - beta[k]) if res.success else 1.0
-        scale[k] = excess if excess > 1e-9 else 1.0
-
-    def hvals(X):
-        return ((X @ R.T - beta) / scale).max(axis=1)
-
-    rng = np.random.default_rng(seed)
-    # level 0: reuse the precomputed uniform cloud (cheap, already uniform on {Ax<=b})
-    base = ds.get_samples(None, "norm")
-    X = base[rng.choice(len(base), min(pop, len(base)), replace=False)]
-    h = hvals(X)
-    x0_base, _ = chebyshev_center(A0, b0)
-
-    prob = 1.0
-    levels = 0
-    while True:
-        frac = float((h <= 0.0).mean())
-        if frac >= p0 or levels >= max_levels:
-            prob *= max(frac, 1.0 / (pop * (levels + 1)))   # final direct estimate
-            break
-        ht = float(np.quantile(h, p0))          # threshold letting ≈ p0 through
-        if ht <= 0.0:
-            prob *= max(frac, 1.0 / pop)
-            break
-        prob *= p0
-        levels += 1
-        seeds = X[h <= ht]
-        start = seeds[rng.integers(len(seeds))] if len(seeds) else x0_base
-        Al = np.vstack([A0, R])
-        bl = np.concatenate([b0, beta + ht * scale])
-        X = hit_and_run(Al, bl, pop, start, seed=seed + levels)
-        if len(X) == 0:                          # sampler stalled; stop conservatively
-            break
-        h = hvals(X)
-
-    # subset-simulation CV (rough; ignores MCMC autocorrelation → optimistic):
-    # δ² ≈ Σ_ℓ (1 - p0) / (p0 · pop). Report as a multiplicative band.
-    cv = float(np.sqrt(levels * (1.0 - p0) / (p0 * pop))) if levels else \
-        float(np.sqrt(max(1.0 - prob, 0.0) / (prob * pop))) if prob > 0 else 0.0
-    return {
-        "feasible": True,
-        "ratio": float(prob),
-        "log10": (float(np.log10(prob)) if prob > 0 else None),
-        "levels": int(levels),
-        "method": "direct" if levels == 0 else "subset_simulation",
-        "cv": cv,
-    }
-
-
 def extremes(ds, sampler: str):
     """For every technology, the designs with its minimum / maximum value over the
     near-optimal polytope (one LP per direction) — the classic MGA extreme
@@ -452,3 +507,121 @@ def generate(ds, sampler: str, n: int, constraints, seed: int = 42):
         "fields": ds.axes,
         "radius": float(radius),
     }
+
+
+# ---- marginals inside the projection onto the shown axes -------------------
+# Hiding an axis is a geometric no-op for the FULL-space marginals: the density
+# of a uniform cloud on P, read along axis a, is the same whether or not some
+# other axis is drawn. That is worldview A, and it is what the violins used to
+# show — so disabling an axis changed nothing on screen.
+#
+# Worldview B instead treats the shown axes AS the design space: it asks for the
+# uniform distribution on the projection pi_S(P), i.e. over the reachable
+# COMBINATIONS of the axes you kept, each counted once regardless of how many
+# ways the hidden axes can realize it. Under B, hiding an axis genuinely reshapes
+# the remaining violins, because the fibre weighting disappears.
+#
+# pi_S(P) has no cheap H-description (Fourier-Motzkin over 219 rows blows up), so
+# we sample it directly: hit-and-run in R^k where the chord along a direction is
+# found by LP in the LIFTED space. y + t d is in pi_S(P) iff some x in P has
+# x_S = y + t d, so
+#
+#     max / min  t   s.t.  A x <= b,  x_S - t d = y
+#
+# gives the exact chord endpoints in two LPs per step. Each axis's own range is
+# preserved by projection, so these samples share the base cloud's scales.
+_BASE_CLOUD_CAP = 20000
+
+
+def _projection_chord(A, b, idx, y, d):
+    """[t_lo, t_hi] such that y + t*d lies in the projection of {Ax<=b} onto idx.
+
+    Variables are (x, t); the equalities pin the projected coordinates to the
+    ray. Returns None if the ray misses the projection (should not happen from
+    an interior point, but a stalled LP must not be mistaken for a chord)."""
+    n = A.shape[1]
+    k = len(idx)
+    A_ub = np.hstack([A, np.zeros((A.shape[0], 1))])
+    A_eq = np.zeros((k, n + 1))
+    for p, i in enumerate(idx):
+        A_eq[p, i] = 1.0
+        A_eq[p, n] = -float(d[p])
+    bounds = [(None, None)] * (n + 1)
+    out = []
+    for sign in (-1.0, 1.0):                     # max t, then min t
+        c = np.zeros(n + 1)
+        c[n] = sign
+        res = linprog(c, A_ub=A_ub, b_ub=b, A_eq=A_eq, b_eq=np.asarray(y, float),
+                      bounds=bounds, method="highs")
+        if not res.success:
+            return None
+        out.append(float(res.x[n]))
+    t_hi, t_lo = out
+    return (t_lo, t_hi) if t_hi - t_lo > 1e-12 else None
+
+
+def projected_marginals(ds, axes, n: int = 1200, seed: int = 42,
+                        burn: int = 40, thin: int = 2):
+    """Uniform sample of pi_S(P) restricted to `axes`, in PHYSICAL units.
+
+    Cached per axis SET (order-independent): the caller re-asks on every toggle,
+    and toggling an axis back should not pay for the sweep twice."""
+    idx = [ds.axes.index(a) for a in axes if a in ds.axes]
+    k = len(idx)
+    if k == 0:
+        return {"axes": [], "values": [], "n": 0, "method": "empty"}
+
+    names = [ds.axes[i] for i in idx]
+    # Every axis shown => pi_S(P) == P, so the base cloud already IS the answer,
+    # and no projection sampling is needed. Capped and seeded on the way out: the
+    # cloud runs to 100k designs and a caller asking for a DISTRIBUTION does not
+    # need (or want to transfer) all of them. The frontend never takes this path
+    # — it already holds the cloud and skips the request entirely — so this is
+    # here for direct API/`/docs` callers.
+    if k == len(ds.axes):
+        vals = ds.get_samples(None, "phys")[:, idx]
+        if len(vals) > _BASE_CLOUD_CAP:
+            pick = np.random.default_rng(seed).choice(
+                len(vals), _BASE_CLOUD_CAP, replace=False)
+            vals = vals[np.sort(pick)]
+        return {"axes": names, "values": vals.tolist(), "n": int(len(vals)),
+                "method": "base_cloud"}
+
+    cache = _slot(ds, "proj_marginals", {})
+    key = (tuple(sorted(idx)), int(n), int(seed))
+    if key in cache:
+        hit = cache[key]
+        order = [hit["axes"].index(a) for a in names]
+        vals = np.asarray(hit["values"])[:, order]
+        return {"axes": names, "values": vals.tolist(), "n": hit["n"],
+                "method": hit["method"]}
+
+    A, b = ds.A, ds.b
+    x0, radius = chebyshev_center(A, b)
+    if x0 is None or radius <= 0:
+        return {"axes": names, "values": [], "n": 0, "method": "degenerate"}
+
+    rng = np.random.default_rng(seed)
+    y = np.asarray(x0, float)[idx]               # projection of an interior point
+    out = np.empty((n, k))
+    got = 0
+    step = 0
+    max_iter = burn + n * thin + 500
+    while got < n and step < max_iter:
+        step += 1
+        d = rng.standard_normal(k)
+        d /= np.linalg.norm(d) + 1e-12
+        chord = _projection_chord(A, b, idx, y, d)
+        if chord is None:
+            continue                             # degenerate direction; redraw
+        t_lo, t_hi = chord
+        y = y + rng.uniform(t_lo, t_hi) * d
+        if step > burn and (step - burn) % thin == 0:
+            out[got] = y
+            got += 1
+
+    vals = out[:got] * ds._scale[idx] + ds._offset[idx]
+    method = "hit_and_run_projection" if got else "stalled"
+    res = {"axes": names, "values": vals.tolist(), "n": int(got), "method": method}
+    cache[key] = res
+    return res

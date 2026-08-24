@@ -12,7 +12,9 @@ from pydantic import BaseModel
 from . import sessions
 from .data import (
     DATA_DIR,
+    MAX_AXES,
     SPACES,
+    WARN_AXES,
     Dataset,
     friendly_name,
     get_dataset,
@@ -22,10 +24,10 @@ from .data import (
 from .generate import dependence as run_dependence
 from .generate import extremes as run_extremes
 from .generate import flexibility as run_flexibility
+from .generate import projected_marginals as run_marginals
 from .generate import generate as run_generate
 from .generate import shadow as run_shadow
 from .generate import shadow_pairs as run_shadow_pairs
-from .generate import volume_ratio as run_volume
 from .projections import METHODS, project
 
 app = FastAPI(title="Energy Explorer API", version="0.1.0")
@@ -82,6 +84,10 @@ app.router.lifespan_context = _lifespan
 def _meta_dict(ds, sid: str | None = None) -> dict:
     return {
         "axes": ds.axes,
+        # physical unit per axis, aligned with `axes` (GW / GWh / ktCO2eq per hour)
+        "units": getattr(ds, "units", [""] * len(ds.axes)),
+        # axes that lump several technologies together → their members
+        "axis_members": getattr(ds, "axis_members", {}),
         "methods": list(METHODS),
         "spaces": list(SPACES),
         "n_samples": ds.n_samples,
@@ -89,6 +95,8 @@ def _meta_dict(ds, sid: str | None = None) -> dict:
             "u_star": ds.u_star.tolist(),   # the cost optimum, technologies only
             "epsilon": ds.epsilon,
             "norm": ds.optimum_norm.tolist(),
+            "c_star": ds.c_star,
+            "cost_unit": getattr(ds, "cost_unit", ""),
         },
         "diagnostics": ds.diagnostics,
         # `id` is what the frontend persists (URL + localStorage) to come back to
@@ -139,8 +147,10 @@ def _warm(ds: Dataset, sid: str) -> dict:
 
 @app.get("/api/datasets")
 def datasets():
-    """Preloaded polytopes available to build from (landing-page picker)."""
-    return {"datasets": list_polytopes()}
+    """Preloaded polytopes available to build from (landing-page picker), plus the
+    axis limits so the page can warn about a slow build before it starts rather
+    than after."""
+    return {"datasets": list_polytopes(), "max_axes": MAX_AXES, "warn_axes": WARN_AXES}
 
 
 class BuildPreloadedRequest(BaseModel):
@@ -324,6 +334,12 @@ class FlexibilityRequest(BaseModel):
     constraints: list[Constraint] = []
 
 
+class MarginalsRequest(BaseModel):
+    # the axes currently SHOWN — the projection is taken onto exactly these
+    axes: list[str]
+    n: int = 1500
+
+
 @app.get("/api/dependence")
 def dependence(sampler: str = Query("chrrt"), ds: Dataset = Depends(current_dataset)):
     """Pairwise dependence between the 10 axes: distance correlation, mutual
@@ -353,13 +369,24 @@ def flexibility(req: FlexibilityRequest, ds: Dataset = Depends(current_dataset))
     return run_flexibility(ds, [c.model_dump() for c in req.constraints])
 
 
-@app.post("/api/volume")
-def volume(req: FlexibilityRequest, ds: Dataset = Depends(current_dataset)):
-    """Relative volume of the constrained near-optimal region vs the whole space
-    ('how much of the design space survives these constraints'). Subset-simulation
-    estimate so it stays accurate deep in the tail, where the uniform-sample
-    fraction the UI computes lands zero points."""
-    return run_volume(ds, [c.model_dump() for c in req.constraints])
+@app.post("/api/marginals")
+def marginals(req: MarginalsRequest, ds: Dataset = Depends(current_dataset)):
+    """Uniform sample of the PROJECTION of the near-optimal body onto the shown
+    axes, in physical units — the distribution the Profiles violins draw.
+
+    Reading the full-space cloud along an axis (worldview A) weights each
+    combination of the shown axes by how many ways the hidden axes can realize
+    it, so hiding an axis leaves every violin identical. This endpoint answers
+    the other question (worldview B): over the reachable COMBINATIONS of the
+    axes you kept, each counted once. With every axis shown the two coincide and
+    the base cloud is returned unchanged."""
+    if not req.axes:
+        raise HTTPException(status_code=422, detail="axes must be non-empty")
+    unknown = [a for a in req.axes if a not in ds.axes]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"unknown axes: {unknown}")
+    n = max(200, min(int(req.n), 4000))
+    return run_marginals(ds, req.axes, n=n)
 
 
 @app.post("/api/generate")

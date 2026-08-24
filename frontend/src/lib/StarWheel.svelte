@@ -85,20 +85,20 @@
 <style>
   .wheel { display: flex; flex-direction: column; align-items: center; gap: 6px; }
   svg { touch-action: none; overflow: visible; }
-  .rim { fill: none; stroke: rgba(255, 255, 255, 0.14); }
-  .rim.faint { stroke: rgba(255, 255, 255, 0.06); }
-  .vec { stroke: rgba(45, 212, 191, 0.55); stroke-width: 1.4; }
+  .rim { fill: none; stroke: var(--b-12); }
+  .rim.faint { stroke: var(--s-05); }
+  .vec { stroke: color-mix(in srgb, var(--accent) 55%, transparent); stroke-width: 1.4; }
   .handle {
-    fill: #10151c; stroke: var(--accent); stroke-width: 2;
+    fill: var(--marker-fill); stroke: var(--accent); stroke-width: 2;
     cursor: grab;
   }
   .handle:hover, .handle.dragging { fill: var(--accent); cursor: grabbing; }
   .lab {
     fill: var(--fg); font-size: 9.5px;
-    paint-order: stroke; stroke: rgba(0, 0, 0, 0.8); stroke-width: 2.5px;
+    paint-order: stroke; stroke: var(--halo); stroke-width: 2.5px;
     pointer-events: none;
   }
   .row { display: flex; gap: 6px; }
   .mini { font-size: 11px; padding: 3px 9px; border-radius: 6px; }
-  .mini.active { background: var(--accent); color: #06241f; border-color: var(--accent); }
+  .mini.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 </style>

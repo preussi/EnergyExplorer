@@ -9,6 +9,7 @@ near-optimality baked in. Samples are fmax-normalized 9-D technology vectors
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -18,6 +19,13 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 
 SPACES = ("norm", "phys")
 COST_AXIS = "net_present_cost"
+# Hard ceiling on technology axes. Both walls land here: the facet warm is
+# quadratic in the axis count (measured — 9 axes = 36 pairs = 2.4 s, 24 = 276
+# pairs ≈ 47 s), and the Profiles rail stops being readable past ~22 px rows,
+# which is also ~24. Above WARN_AXES the build is slow enough to be worth
+# predicting on the landing page rather than discovering.
+MAX_AXES = 24
+WARN_AXES = 16
 # Upstream ships ~400k samples; that is far more than the UI needs and would make
 # /api/samples a ~50MB payload. Cap to a seeded, deterministic subset (plenty for
 # projections, clustering, dependence and the marginal/conditional violins).
@@ -27,7 +35,13 @@ MAX_SAMPLES = int(os.environ.get("MAX_SAMPLES", "400000"))
 # when a caller doesn't specify one (e.g. the lazily-built file default).
 DEFAULT_N_SAMPLES = int(os.environ.get("DEFAULT_N_SAMPLES", "20000"))
 # Human-friendly labels for the preloaded polytope files (falls back to the stem).
-_FRIENDLY = {"polytope_13": "Swiss energy system (v13)"}
+_FRIENDLY = {
+    "polytope_13": "Swiss energy system (v13)",
+    # Synthetic, for workshops — see scripts/make_demo_polytope.py. The stem sorts
+    # BEFORE polytope_13 on purpose: `_resolve` takes the last match, so a name
+    # like "polytope_demo" would quietly become the shipped default.
+    "polytope_0_infrastructure_demo": "Riverside city plan (demo)",
+}
 
 
 def friendly_name(stem: str) -> str:
@@ -118,6 +132,27 @@ class Dataset:
 
         self.c_star = float(np.asarray(poly["c_star"])) if "c_star" in _keys(poly) else float("nan")
         self.epsilon = float(np.asarray(poly["epsilon"])) if "epsilon" in _keys(poly) else 0.1
+
+        # Physical unit per technology axis, straight from the file (the producer
+        # ships `units`, aligned with name_list). Without this the UI shows bare
+        # numbers and "12.4" could be GW, GWh or ktCO2/h depending on the row.
+        # `cost_unit` is kept separately: cost is not an axis after the projection.
+        raw_units = ([str(u) for u in poly["units"]] if "units" in _keys(poly)
+                     else [""] * len(names))
+        self.units = [raw_units[i] for i in range(len(names)) if i != cost_col]
+        self.cost_unit = raw_units[cost_col] if len(raw_units) == len(names) else ""
+        # An axis can lump several technologies together (e.g. ccs_lump covers six
+        # CCS plants); surface the members so the UI can say what it contains.
+        self.axis_members: dict[str, list[str]] = {}
+        if "axis_meta_json" in _keys(poly):
+            try:
+                meta_j = json.loads(str(np.asarray(poly["axis_meta_json"])))
+                for ax in meta_j.get("axes", []):
+                    mem = [str(m) for m in ax.get("members", [])]
+                    if len(mem) > 1:
+                        self.axis_members[str(ax["name"])] = mem
+            except (ValueError, KeyError, TypeError):
+                pass  # metadata is a nicety; a malformed blob must not break loading
 
         # fmax normalization: phys = norm * u_star (per-axis maxima), offset 0.
         self.norm_max = np.asarray(poly["u_star"], dtype=float)      # (9,)
@@ -214,6 +249,13 @@ def validate_polytope(poly) -> list[str]:
         problems.append(f"name_list must include the cost axis '{COST_AXIS}'")
         return problems
     n_tech = len(names) - 1
+    if n_tech > MAX_AXES:
+        problems.append(
+            f"{n_tech} technology axes exceeds the {MAX_AXES}-axis limit "
+            f"({n_tech * (n_tech - 1) // 2} facet pairs would take minutes to "
+            f"precompute, and the Profiles rail cannot render that many rows)")
+    if n_tech < 2:
+        problems.append(f"need at least 2 technology axes; got {n_tech}")
 
     A = np.asarray(poly["A"])
     if A.ndim != 2 or A.shape[1] != len(names):

@@ -9,10 +9,17 @@ export interface DatasetInfo {
 
 export interface Meta {
   axes: string[]; // 9 technologies (cost is not a design axis)
+  units?: string[]; // physical unit per axis, aligned with `axes`
+  axis_members?: Record<string, string[]>; // axes that lump several technologies
   methods: string[];
   spaces: string[];
   n_samples: number;
-  optimum: { u_star: number[]; epsilon: number; norm: number[] }; // u_star = the optimum, techs only
+  // u_star = the optimum, techs only. c_star/cost_unit describe the cost budget
+  // the near-optimal body is built around (cost ≤ (1+epsilon)·c_star).
+  optimum: {
+    u_star: number[]; epsilon: number; norm: number[];
+    c_star?: number; cost_unit?: string;
+  };
   diagnostics: { method: string; rhat: number[]; ess: number[] };
   dataset: DatasetInfo; // which data is currently loaded (default vs uploaded)
 }
@@ -148,8 +155,16 @@ export interface PreloadedDataset {
   n_axes: number;
 }
 
-export function getDatasets(): Promise<{ datasets: PreloadedDataset[] }> {
-  return getJSON<{ datasets: PreloadedDataset[] }>("/api/datasets");
+export interface DatasetList {
+  datasets: PreloadedDataset[];
+  /** hard ceiling on technology axes (uploads above this are a 422) */
+  max_axes?: number;
+  /** above this a build is slow enough to be worth predicting up front */
+  warn_axes?: number;
+}
+
+export function getDatasets(): Promise<DatasetList> {
+  return getJSON<DatasetList>("/api/datasets");
 }
 
 // Build the active dataset from a preloaded polytope: the backend generates
@@ -238,10 +253,41 @@ export interface ConstraintInput {
   max?: number | null;
 }
 
+/** Which bounding-box corners a facet cannot reach, normalized to the unit
+ *  square. 0 = that corner is attainable. See generate.py `corner_gaps`. */
+export interface CornerGaps { LL: number; LR: number; UL: number; UR: number }
+
+export type FacetCategory =
+  | "independent"    // no corner cut — decide the two separately
+  | "tradeoff"       // UR cut — cannot both be large
+  | "dependency"     // LR/UL cut — one at scale requires the other (directional)
+  | "at_least_one"   // LL cut — cannot both be small
+  | "band"           // LL+UR — substitute one-for-one, total pinned
+  | "locked"         // UL+LR — must move together
+  | "unknown";
+
+export interface FacetShape {
+  category: FacetCategory;
+  strength: number;   // size of the largest corner gap, 0..1
+  cut: string[];      // which corners, strongest first
+  detail: string;     // plain-language statement
+  needs?: string;     // dependency only: the axis that requires…
+  needed?: string;    // …this one
+  /** the deciding gap is close enough to the threshold that the label could flip */
+  borderline?: boolean;
+}
+
 export interface ShadowPair {
   x: string;
   y: string;
-  boxiness: number;
+  boxiness: number | null;
+  corner_gaps?: CornerGaps | null;
+  shape?: FacetShape;
+  /** the shadow outline, so the matrix draws all its minis from ONE response */
+  polygon?: number[][] | null;
+  /** true when the build's facet budget ran out before reaching this pair —
+   *  fetch it individually via getShadow */
+  pending?: boolean;
 }
 
 export interface Shadow {
@@ -251,6 +297,8 @@ export interface Shadow {
   polygon: number[][]; // physical units, hull-ordered
   boxiness: number | null;
   optimum: [number, number];
+  corner_gaps?: CornerGaps | null;
+  shape?: FacetShape;
 }
 
 export interface FlexRange {
@@ -266,6 +314,13 @@ export interface Flexibility {
 
 export function getShadowPairs(): Promise<{ pairs: ShadowPair[] }> {
   return getJSON("/api/shadow_pairs");
+}
+
+/** Transpose a facet: the API returns each pair once, in canonical axis order,
+ *  but the matrix may need it as (column, row). LL/UR are fixed under transpose;
+ *  LR and UL swap. */
+export function flipGaps(g: CornerGaps): CornerGaps {
+  return { LL: g.LL, UR: g.UR, LR: g.UL, UL: g.LR };
 }
 
 export type DependenceMetric = "dcor" | "mi" | "pearson";
@@ -295,17 +350,23 @@ export function getFlexibility(constraints: ConstraintInput[] = []): Promise<Fle
   return postJSON<Flexibility>("/api/flexibility", { constraints });
 }
 
-export interface VolumeEstimate {
-  feasible: boolean;
-  ratio: number;         // vol(constrained) / vol(full), in [0,1]
-  log10: number | null;  // log10(ratio); null when ratio == 0
-  levels: number;        // subset-simulation levels used (0 = direct estimate)
-  method: "trivial" | "direct" | "subset_simulation" | "empty";
-  cv: number;            // coefficient of variation (approx relative std of ratio)
+export interface Marginals {
+  /** the axes the projection was taken onto, in the order the values follow */
+  axes: string[];
+  /** uniform sample of pi_S(P), physical units */
+  values: number[][];
+  n: number;
+  method: "base_cloud" | "hit_and_run_projection" | "degenerate" | "stalled" | "empty";
 }
 
-export function getVolume(constraints: ConstraintInput[] = []): Promise<VolumeEstimate> {
-  return postJSON<VolumeEstimate>("/api/volume", { constraints });
+/** Distribution the Profiles violins draw, measured in the PROJECTION onto the
+ *  shown axes (worldview B): reachable combinations of those axes, each counted
+ *  once, rather than the full-space cloud read along one axis (which weights a
+ *  combination by how many ways the hidden axes realize it — and so is identical
+ *  whether or not an axis is hidden). Costs ~3.5 ms/sample, hence the debounce.
+ *  With every axis shown the backend returns the base cloud unchanged. */
+export function getMarginals(axes: string[], n = 1500): Promise<Marginals> {
+  return postJSON<Marginals>("/api/marginals", { axes, n });
 }
 
 export interface GenerateResult {

@@ -1,10 +1,128 @@
+/* Theme tokens.
+ *
+ * Dark is the default; light is a SELECTED set, not an automatic inversion —
+ * every value below was checked for contrast rather than flipped. Measured on
+ * #ffffff: accent #0b7f72 4.89:1 (it is used as TEXT for axis names, so it needs
+ * 4.5:1, which #2dd4bf at 1.86:1 nowhere near meets), muted #5b6672 5.85:1,
+ * body #16202b 16.5:1, amber #a16207 4.92:1.
+ *
+ * The neutral scrims (--s-*, --b-*) are the workhorses: most of the app's chrome
+ * is a white wash over a dark panel, and in light mode those must become black
+ * washes over a white one. Defining them here is what makes the components
+ * theme-agnostic instead of needing a light rule per component.
+ */
 :root {
+  color-scheme: dark;
+
   --bg: #0f1419;
   --panel: #1a2129;
+  --panel-glass: rgba(16, 21, 28, 0.62);
   --fg: #e6edf3;
   --muted: #8b949e;
   --accent: #2dd4bf;
+  --on-accent: #06241f;
+  --warn: #f0a14e;
+  --amber: #f4b43c;
+  --amber-soft: rgba(244, 180, 60, 0.10);
+  --amber-line: rgba(244, 180, 60, 0.7);
+  --neutral-line: rgba(139, 148, 158, 0.35);
+  --neutral-fill: rgba(139, 148, 158, 0.05);
+  --violin-fill: rgba(139, 148, 158, 0.13);
+  --violin-line: rgba(139, 148, 158, 0.4);
+  --rule: #2a3441;
+  --field-border: #30363d;
+  --tick: #fff;
+  --danger: #f85149;
+  --shadow-text: rgba(0, 0, 0, 0.95);
+  --panel-solid: rgba(16, 21, 28, 0.97);
+  --marker-fill: #0d1117;
+  --halo: rgba(0, 0, 0, 0.7);
+  --extreme: #f2c52e;
+  --axis-line: #45505c;
+  /* chart scaffolding (radar rings/spokes) — heavier than the --s-* scrims,
+     which are surface washes and disappear when asked to draw a line */
+  --grid: rgba(255, 255, 255, 0.17);
+  --limit: #6ba3f0;
+
+  /* neutral scrims — these invert in light mode */
+  --s-02: rgba(255, 255, 255, 0.02);
+  --s-03: rgba(255, 255, 255, 0.03);
+  --s-05: rgba(255, 255, 255, 0.05);
+  --s-09: rgba(255, 255, 255, 0.09);
+  --b-08: rgba(255, 255, 255, 0.08);
+  --b-12: rgba(255, 255, 255, 0.12);
+  --b-20: rgba(255, 255, 255, 0.2);
+  /* No drop shadows anywhere: the panels are separated by FROST (translucency +
+     a heavy blur + a light border), not by a cast shadow. Kept as tokens rather
+     than deleted so a component reaching for one gets `none` instead of an
+     invalid declaration, which would void its whole rule. */
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  --page: #0f1419;
+
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The toggle wins in both directions; the media query only supplies the default
+   for someone who has never touched it (see App's theme boot). */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* CONTRAST NOTE. A white-on-dark wash and a black-on-white wash at the same
+     alpha do NOT read the same: light-on-dark blooms, dark-on-light does not, so
+     the light theme needs materially bigger alphas to carry the same structure.
+     The --s-*/--b-* scrims here are therefore ~1.4x their dark counterparts, and
+     the fixed greys (--rule, --field-border, --axis-line) were darkened a step.
+     Symptom that started this: the radar web (--grid, formerly --s-09 at 8%) was
+     ~1.08:1 on white — invisible. */
+
+  --bg: #eef1f5;
+  --panel: #ffffff;
+  --panel-glass: rgba(255, 255, 255, 0.82);
+  --fg: #16202b;
+  --muted: #4a5563;
+  --accent: #0b7f72;
+  --on-accent: #ffffff;
+  --warn: #b45309;
+  --amber: #a16207;
+  --amber-soft: rgba(161, 98, 7, 0.15);
+  --amber-line: rgba(161, 98, 7, 0.9);
+  --neutral-line: rgba(80, 92, 105, 0.6);
+  --neutral-fill: rgba(80, 92, 105, 0.1);
+  /* Light mode gives the violins their own COOL BLUE rather than reusing the
+     neutral grey. On white a mid-grey outline reads as a drop shadow of the row
+     rather than as a mark, and it went muddy where it crossed the warm amber
+     flexibility band behind it. This is a real hue, sits at ~4.2:1 on white and
+     ~4:1 over the amber band, and still reads as subordinate to the teal accent
+     used for the brushed conditional violin. Dark mode keeps its neutral: on a
+     dark panel a light grey already reads as "cloud". */
+  --violin-fill: rgba(58, 90, 130, 0.24);
+  --violin-line: rgba(42, 72, 110, 0.85);
+  --rule: #c2ccd9;
+  --field-border: #aeb9c7;
+  --tick: #16202b;
+  --danger: #c02b1d;
+  --shadow-text: rgba(255, 255, 255, 0.95);
+  --panel-solid: rgba(255, 255, 255, 0.98);
+  --marker-fill: #ffffff;
+  --halo: rgba(255, 255, 255, 0.85);
+  --extreme: #a86a00;
+  --axis-line: #8b97a6;
+  --limit: #1f5ea8;
+  --grid: rgba(0, 0, 0, 0.22);
+
+  --s-02: rgba(0, 0, 0, 0.03);
+  --s-03: rgba(0, 0, 0, 0.045);
+  --s-05: rgba(0, 0, 0, 0.07);
+  --s-09: rgba(0, 0, 0, 0.12);
+  --b-08: rgba(0, 0, 0, 0.14);
+  --b-12: rgba(0, 0, 0, 0.21);
+  --b-20: rgba(0, 0, 0, 0.34);
+  --shadow-md: none;
+  --shadow-lg: none;
+
+  --page: #eef1f5;
 }
 
 * { box-sizing: border-box; }
@@ -15,12 +133,11 @@ html, body, #app {
 
 body {
   margin: 0;
-  /* deep-space backdrop so panels read as floating */
-  background:
-    radial-gradient(1200px 700px at 22% 12%, #18222f 0%, transparent 60%),
-    radial-gradient(1000px 800px at 85% 90%, #141d2a 0%, transparent 55%),
-    #070a0e;
-  background-attachment: fixed;
+  /* One flat colour per theme — the BACKGROUND only. This used to be a pair of
+     radial gradients; the fade is gone, but the panels above it keep their glass
+     (translucent --panel-glass + blur) and their drop shadows, which is what makes
+     them read as floating over the flat ground. */
+  background: var(--page);
   color: var(--fg);
 }
 
@@ -32,7 +149,7 @@ body {
 button, select {
   background: var(--panel);
   color: var(--fg);
-  border: 1px solid #30363d;
+  border: 1px solid var(--field-border);
   border-radius: 6px;
   padding: 6px 10px;
   font-size: 13px;
